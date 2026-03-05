@@ -233,36 +233,59 @@ def detect_chords(audio_path: str) -> list[dict]:
         for name in template_names
     ])  # shape: (n_chords, 12)
 
-    # --- Mejora 5: Clasificacion vectorizada (mas rapida y precisa) ---
-    # Producto punto de cada frame con cada plantilla
+    # --- Clasificacion: preferir acordes simples (mayor/menor) ---
+    # Solo usar acordes extendidos si su score es significativamente mejor
+    BASIC_CHORDS = {n for n in template_names if n[-1] not in ('7',) and not any(n.endswith(s) for s in ('m7', 'maj7', 'sus2', 'sus4', 'dim'))}
+    EXTENDED_BONUS = 0.12  # el acorde extendido debe superar al basico por este margen
+
     scores = template_matrix @ chroma_norm  # shape: (n_chords, n_frames)
-    best_indices = np.argmax(scores, axis=0)
-    best_scores = np.max(scores, axis=0)
 
     raw_chords: list[str | None] = []
-    for i in range(chroma.shape[1]):
-        if best_scores[i] < 0.5:  # umbral de confianza mas estricto
+    for frame_idx in range(chroma.shape[1]):
+        frame_scores = scores[:, frame_idx]
+        if np.max(frame_scores) < 0.55:
             raw_chords.append(None)
-        else:
-            raw_chords.append(template_names[best_indices[i]])
+            continue
 
-    # --- Mejora 6: Filtro de mediana sobre la secuencia de acordes ---
-    # Convertir a indices numericos para filtrar
+        # Mejor acorde basico (mayor o menor)
+        best_basic_score = -1.0
+        best_basic = None
+        # Mejor acorde extendido
+        best_ext_score = -1.0
+        best_ext = None
+
+        for j, name in enumerate(template_names):
+            s = frame_scores[j]
+            if name in BASIC_CHORDS:
+                if s > best_basic_score:
+                    best_basic_score = s
+                    best_basic = name
+            else:
+                if s > best_ext_score:
+                    best_ext_score = s
+                    best_ext = name
+
+        # Usar el extendido SOLO si supera al basico por un margen claro
+        if best_ext is not None and best_ext_score > best_basic_score + EXTENDED_BONUS:
+            raw_chords.append(best_ext)
+        else:
+            raw_chords.append(best_basic)
+
+    # --- Filtro de mediana sobre la secuencia para eliminar parpadeos ---
     chord_to_idx = {name: idx for idx, name in enumerate(template_names)}
     chord_to_idx[None] = -1
     idx_sequence = np.array([chord_to_idx.get(c, -1) for c in raw_chords])
 
-    if len(idx_sequence) > 3:
-        # Aplicar filtro de mediana para eliminar cambios muy rapidos
-        filtered = median_filter(idx_sequence.astype(float), size=3).astype(int)
+    if len(idx_sequence) > 5:
+        filtered = median_filter(idx_sequence.astype(float), size=5).astype(int)
         idx_to_chord = {idx: name for name, idx in chord_to_idx.items()}
         raw_chords = [idx_to_chord.get(int(idx)) for idx in filtered]
 
-    # Generar eventos de cambio de acorde
+    # --- Generar eventos: solo cuando el acorde CAMBIA, duracion minima 1.5s ---
     chord_events: list[dict] = []
     current_chord: str | None = None
     current_start = 0.0
-    min_duration = 0.3  # reducido porque ya filtramos por beats
+    min_duration = 1.5
 
     for i, chord in enumerate(raw_chords):
         if chord != current_chord:
@@ -270,6 +293,7 @@ def detect_chords(audio_path: str) -> list[dict]:
                 duration = times[i] - current_start
                 if duration >= min_duration:
                     chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
+                # Si es muy corto, se descarta (era ruido)
             current_chord = chord
             current_start = times[i] if i < len(times) else current_start
 
@@ -315,13 +339,27 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
             if active_chord:
                 seg_chords.append({"chord": active_chord, "charIndex": 0})
 
-        # Eliminar acordes duplicados en la misma posicion
-        seen: set[int] = set()
+        # Eliminar acordes duplicados en la misma posicion y acordes repetidos consecutivos
+        seen_positions: set[int] = set()
         unique_chords: list[dict] = []
+        prev_chord_name: str | None = None
         for c in seg_chords:
-            if c["charIndex"] not in seen:
-                seen.add(c["charIndex"])
+            # No repetir el mismo acorde consecutivamente
+            if c["chord"] == prev_chord_name:
+                continue
+            if c["charIndex"] not in seen_positions:
+                seen_positions.add(c["charIndex"])
                 unique_chords.append(c)
+                prev_chord_name = c["chord"]
+
+        # Limitar a maximo 3 acordes por linea (los mas espaciados)
+        if len(unique_chords) > 3:
+            # Quedarse con el primero, ultimo, y el del medio
+            first = unique_chords[0]
+            last = unique_chords[-1]
+            mid_idx = len(unique_chords) // 2
+            mid = unique_chords[mid_idx]
+            unique_chords = [first, mid, last]
 
         current_lines.append({
             "lyrics": seg["text"],
