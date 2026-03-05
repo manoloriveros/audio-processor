@@ -130,16 +130,16 @@ async def process_audio(
 # Paso 1: Transcripcion con OpenAI Audio API
 # ---------------------------------------------------------------------------
 def transcribe_with_whisper(audio_path: str) -> dict:
-    """Transcribe audio usando la API de OpenAI (gpt-4o-mini-transcribe) con marcas de tiempo."""
+    """Transcribe audio usando Whisper (verbose_json para obtener timestamps por segmento)."""
     import openai
 
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
     with open(audio_path, "rb") as f:
         response = client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
+            model="whisper-1",
             file=f,
-            response_format="json",
+            response_format="verbose_json",
             timestamp_granularities=["segment"],
             language="es",
         )
