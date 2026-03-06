@@ -313,13 +313,70 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
     if not segments:
         return {"sections": [], "detectedKey": "C", "keyType": "major"}
 
+    # --- Paso A: Dividir segmentos largos en lineas mas cortas ---
+    MAX_LINE_LEN = 45  # caracteres maximos por linea
+    split_segments = []
+    for seg in segments:
+        text = seg["text"].strip()
+        if len(text) <= MAX_LINE_LEN:
+            split_segments.append(seg)
+            continue
+
+        # Dividir por comas o puntos naturales
+        duration = seg["end"] - seg["start"]
+        parts: list[str] = []
+        current_part = ""
+        for word in text.split():
+            test = (current_part + " " + word).strip()
+            if len(test) > MAX_LINE_LEN and current_part:
+                parts.append(current_part)
+                current_part = word
+            else:
+                current_part = test
+            # Tambien cortar en comas si ya es suficientemente largo
+            if current_part.endswith(",") and len(current_part) > 15:
+                parts.append(current_part)
+                current_part = ""
+        if current_part:
+            parts.append(current_part)
+
+        if not parts:
+            split_segments.append(seg)
+            continue
+
+        # Distribuir el tiempo proporcionalmente al largo del texto
+        total_chars = sum(len(p) for p in parts)
+        time_cursor = seg["start"]
+        for part in parts:
+            part_duration = duration * (len(part) / max(total_chars, 1))
+            split_segments.append({
+                "text": part.strip(),
+                "start": round(time_cursor, 3),
+                "end": round(time_cursor + part_duration, 3),
+            })
+            time_cursor += part_duration
+
+    segments = split_segments
+
+    # --- Paso B: Asignar acordes a cada linea ---
     sections: list[dict] = []
     current_lines: list[dict] = []
     section_counter = 1
 
     for i, seg in enumerate(segments):
-        # Encontrar acordes dentro del rango temporal de este segmento
         seg_chords: list[dict] = []
+
+        # (Ajuste 2) Acorde activo justo antes de esta linea -> ponerlo al inicio
+        last_before = None
+        for chord_ev in chords_data:
+            if chord_ev["time"] < seg["start"]:
+                last_before = chord_ev
+            else:
+                break
+        if last_before:
+            seg_chords.append({"chord": last_before["chord"], "charIndex": 0})
+
+        # Acordes que caen DENTRO del rango temporal de esta linea
         for chord_ev in chords_data:
             if seg["start"] <= chord_ev["time"] < seg["end"]:
                 seg_duration = max(seg["end"] - seg["start"], 0.01)
@@ -328,23 +385,19 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
                 char_index = max(0, min(char_index, len(seg["text"])))
                 seg_chords.append({"chord": chord_ev["chord"], "charIndex": char_index})
 
-        # Si no hay acordes internos, buscar el acorde activo al inicio
-        if not seg_chords:
-            active_chord = None
-            for chord_ev in chords_data:
-                if chord_ev["time"] <= seg["start"]:
-                    active_chord = chord_ev["chord"]
-                else:
-                    break
-            if active_chord:
-                seg_chords.append({"chord": active_chord, "charIndex": 0})
+        # (Ajuste 3) Acordes entre el fin de esta linea y el inicio de la siguiente
+        # -> agregarlos al final de esta linea
+        next_start = segments[i + 1]["start"] if i < len(segments) - 1 else seg["end"] + 10
+        for chord_ev in chords_data:
+            if seg["end"] <= chord_ev["time"] < next_start:
+                # Ponerlo al final del texto
+                seg_chords.append({"chord": chord_ev["chord"], "charIndex": len(seg["text"])})
 
-        # Eliminar acordes duplicados en la misma posicion y acordes repetidos consecutivos
+        # Deduplicar: quitar acordes repetidos consecutivos y misma posicion
         seen_positions: set[int] = set()
         unique_chords: list[dict] = []
         prev_chord_name: str | None = None
         for c in seg_chords:
-            # No repetir el mismo acorde consecutivamente
             if c["chord"] == prev_chord_name:
                 continue
             if c["charIndex"] not in seen_positions:
@@ -352,13 +405,11 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
                 unique_chords.append(c)
                 prev_chord_name = c["chord"]
 
-        # Limitar a maximo 3 acordes por linea (los mas espaciados)
+        # Limitar a maximo 3 acordes por linea
         if len(unique_chords) > 3:
-            # Quedarse con el primero, ultimo, y el del medio
             first = unique_chords[0]
             last = unique_chords[-1]
-            mid_idx = len(unique_chords) // 2
-            mid = unique_chords[mid_idx]
+            mid = unique_chords[len(unique_chords) // 2]
             unique_chords = [first, mid, last]
 
         current_lines.append({
