@@ -32,16 +32,59 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Plantillas de acordes extendidas
-# 12 notas x 8 tipos = 96 acordes
+# Plantillas de acordes (mayor, menor, 7)
+# 12 notas x 3 tipos = 36 acordes
 # ---------------------------------------------------------------------------
 NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+ENHARMONIC_TO_FLAT = {"C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb"}
+
 
 def _build_template(root_idx: int, intervals: list[tuple[int, float]]) -> np.ndarray:
     t = np.zeros(12)
     for semitone, weight in intervals:
         t[(root_idx + semitone) % 12] = weight
     return t
+
+
+def _to_flat(chord_name: str) -> str:
+    """Convierte nombre con sostenido a bemol (A#m -> Bbm)."""
+    for sharp, flat in ENHARMONIC_TO_FLAT.items():
+        if chord_name.startswith(sharp):
+            return flat + chord_name[len(sharp):]
+    return chord_name
+
+
+def _use_flats(key: str, key_type: str) -> bool:
+    """Determina si la tonalidad usa bemoles."""
+    flat_minor_roots = {2, 7, 0, 5}  # D, G, C, F
+    flat_major_roots = {5, 10, 3, 8}  # F, Bb, Eb, Ab
+    key_idx = NOTES.index(key) if key in NOTES else -1
+    if key_type == "minor":
+        return key_idx in flat_minor_roots
+    return key_idx in flat_major_roots
+
+
+def _build_diatonic_set(key: str, key_type: str) -> set[str]:
+    """Construye el conjunto de acordes diatonicos para una tonalidad."""
+    key_idx = NOTES.index(key) if key in NOTES else 0
+    if key_type == "minor":
+        intervals = [0, 2, 3, 5, 7, 8, 10]
+        qualities = ["m", "", "", "m", "m", "", ""]
+    else:
+        intervals = [0, 2, 4, 5, 7, 9, 11]
+        qualities = ["", "m", "m", "", "", "m", ""]
+
+    diatonic = set()
+    for iv, q in zip(intervals, qualities):
+        note = NOTES[(key_idx + iv) % 12]
+        diatonic.add(note + q)
+        if iv == 7:  # V7 es comun en ambos modos
+            diatonic.add(note + "7")
+            if key_type == "minor":
+                diatonic.add(note)  # V mayor en menor armonico
+    return diatonic
+
 
 CHORD_TEMPLATES: dict[str, np.ndarray] = {}
 for _i, _note in enumerate(NOTES):
@@ -51,16 +94,6 @@ for _i, _note in enumerate(NOTES):
     CHORD_TEMPLATES[f"{_note}m"] = _build_template(_i, [(0, 1.0), (3, 0.8), (7, 0.8)])
     # Septima dominante: 1 - 3M - 5J - 7m
     CHORD_TEMPLATES[f"{_note}7"] = _build_template(_i, [(0, 1.0), (4, 0.7), (7, 0.7), (10, 0.5)])
-    # Menor septima: 1 - 3m - 5J - 7m
-    CHORD_TEMPLATES[f"{_note}m7"] = _build_template(_i, [(0, 1.0), (3, 0.7), (7, 0.7), (10, 0.5)])
-    # Mayor septima: 1 - 3M - 5J - 7M
-    CHORD_TEMPLATES[f"{_note}maj7"] = _build_template(_i, [(0, 1.0), (4, 0.7), (7, 0.7), (11, 0.5)])
-    # Suspendida 4: 1 - 4J - 5J
-    CHORD_TEMPLATES[f"{_note}sus4"] = _build_template(_i, [(0, 1.0), (5, 0.8), (7, 0.8)])
-    # Suspendida 2: 1 - 2M - 5J
-    CHORD_TEMPLATES[f"{_note}sus2"] = _build_template(_i, [(0, 1.0), (2, 0.8), (7, 0.8)])
-    # Disminuido: 1 - 3m - 5dis
-    CHORD_TEMPLATES[f"{_note}dim"] = _build_template(_i, [(0, 1.0), (3, 0.8), (6, 0.8)])
 
 
 # ---------------------------------------------------------------------------
@@ -188,39 +221,35 @@ def transcribe_with_whisper(audio_path: str) -> dict:
 # ---------------------------------------------------------------------------
 def detect_chords(audio_path: str) -> list[dict]:
     """
-    Detecta acordes con mayor precision usando:
+    Detecta acordes usando:
     1. HPSS (separacion armonica/percusiva) para aislar contenido tonal
-    2. Cromagrama CQT sobre la componente armonica
+    2. Cromagrama CENS sobre la componente armonica (robusto para acordes)
     3. Analisis sincronizado por beats (un acorde por beat)
     4. Filtro de mediana para suavizar transiciones espurias
-    5. Plantillas extendidas (mayor, menor, 7, m7, maj7, sus2, sus4, dim)
+    5. Dos pasadas: primera detecta tonalidad, segunda aplica sesgo diatonico
     """
     import librosa
     from scipy.ndimage import median_filter
 
-    # Cargar audio (mono, 22050 Hz)
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
 
-    # --- Mejora 1: Separar componente armonica (quita percusion) ---
+    # Separar componente armonica (quita percusion)
     y_harmonic, _ = librosa.effects.hpss(y)
 
-    # --- Mejora 2: Detectar beats para sincronizar analisis ---
+    # Detectar beats para sincronizar analisis
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
+    hop_length = 512
+
     if len(beat_frames) < 2:
-        # Fallback si no detecta beats: usar frames regulares
         hop_length = 2048
-        chroma = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=hop_length)
+        chroma = librosa.feature.chroma_cens(y=y_harmonic, sr=sr, hop_length=hop_length)
         times = librosa.frames_to_time(range(chroma.shape[1]), sr=sr, hop_length=hop_length)
     else:
-        # Cromagrama sobre la componente armonica
-        hop_length = 512
-        chroma_full = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=hop_length)
-
-        # --- Mejora 3: Sincronizar al beat (promedio del cromagrama por beat) ---
+        chroma_full = librosa.feature.chroma_cens(y=y_harmonic, sr=sr, hop_length=hop_length)
         chroma = librosa.util.sync(chroma_full, beat_frames, aggregate=np.median)
         times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
 
-    # --- Mejora 4: Filtro de mediana temporal sobre el cromagrama ---
+    # Filtro de mediana temporal
     if chroma.shape[1] > 5:
         chroma = median_filter(chroma, size=(1, 5))
 
@@ -233,47 +262,45 @@ def detect_chords(audio_path: str) -> list[dict]:
     template_matrix = np.array([
         CHORD_TEMPLATES[name] / (np.linalg.norm(CHORD_TEMPLATES[name]) + 1e-10)
         for name in template_names
-    ])  # shape: (n_chords, 12)
+    ])
 
-    # --- Clasificacion: preferir acordes simples (mayor/menor) ---
-    # Solo usar acordes extendidos si su score es significativamente mejor
-    BASIC_CHORDS = {n for n in template_names if n[-1] not in ('7',) and not any(n.endswith(s) for s in ('m7', 'maj7', 'sus2', 'sus4', 'dim'))}
-    EXTENDED_BONUS = 0.12  # el acorde extendido debe superar al basico por este margen
+    BASIC_CHORDS = {n for n in template_names if not n.endswith("7")}
+    EXTENDED_BONUS = 0.15
+    scores = template_matrix @ chroma_norm
 
-    scores = template_matrix @ chroma_norm  # shape: (n_chords, n_frames)
-
-    raw_chords: list[str | None] = []
-    for frame_idx in range(chroma.shape[1]):
-        frame_scores = scores[:, frame_idx]
+    def _classify_frame(frame_idx: int, diatonic_bonus: dict[str, float] | None = None):
+        frame_scores = scores[:, frame_idx].copy()
+        if diatonic_bonus:
+            for j, name in enumerate(template_names):
+                frame_scores[j] += diatonic_bonus.get(name, 0.0)
         if np.max(frame_scores) < 0.55:
-            raw_chords.append(None)
-            continue
-
-        # Mejor acorde basico (mayor o menor)
-        best_basic_score = -1.0
-        best_basic = None
-        # Mejor acorde extendido
-        best_ext_score = -1.0
-        best_ext = None
-
+            return None
+        best_basic_score, best_basic = -1.0, None
+        best_ext_score, best_ext = -1.0, None
         for j, name in enumerate(template_names):
             s = frame_scores[j]
             if name in BASIC_CHORDS:
                 if s > best_basic_score:
-                    best_basic_score = s
-                    best_basic = name
+                    best_basic_score, best_basic = s, name
             else:
                 if s > best_ext_score:
-                    best_ext_score = s
-                    best_ext = name
+                    best_ext_score, best_ext = s, name
+        if best_ext and best_ext_score > best_basic_score + EXTENDED_BONUS:
+            return best_ext
+        return best_basic
 
-        # Usar el extendido SOLO si supera al basico por un margen claro
-        if best_ext is not None and best_ext_score > best_basic_score + EXTENDED_BONUS:
-            raw_chords.append(best_ext)
-        else:
-            raw_chords.append(best_basic)
+    # --- Pasada 1: clasificacion sin sesgo -> detectar tonalidad ---
+    raw_pass1 = [_classify_frame(i) for i in range(chroma.shape[1])]
+    names_pass1 = [c for c in raw_pass1 if c is not None]
+    det_key, det_type = _detect_key(names_pass1)
+    diatonic = _build_diatonic_set(det_key, det_type)
+    logger.info("Tonalidad detectada (pasada 1): %s %s, diatonicos: %s", det_key, det_type, diatonic)
 
-    # --- Filtro de mediana sobre la secuencia para eliminar parpadeos ---
+    # --- Pasada 2: clasificacion con sesgo diatonico ---
+    bonus = {name: 0.08 for name in diatonic}
+    raw_chords: list[str | None] = [_classify_frame(i, bonus) for i in range(chroma.shape[1])]
+
+    # Filtro de mediana sobre la secuencia
     chord_to_idx = {name: idx for idx, name in enumerate(template_names)}
     chord_to_idx[None] = -1
     idx_sequence = np.array([chord_to_idx.get(c, -1) for c in raw_chords])
@@ -283,11 +310,11 @@ def detect_chords(audio_path: str) -> list[dict]:
         idx_to_chord = {idx: name for name, idx in chord_to_idx.items()}
         raw_chords = [idx_to_chord.get(int(idx)) for idx in filtered]
 
-    # --- Generar eventos: solo cuando el acorde CAMBIA, duracion minima 1.5s ---
+    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima 2.0s
     chord_events: list[dict] = []
     current_chord: str | None = None
     current_start = 0.0
-    min_duration = 1.5
+    min_duration = 2.0
 
     for i, chord in enumerate(raw_chords):
         if chord != current_chord:
@@ -295,7 +322,6 @@ def detect_chords(audio_path: str) -> list[dict]:
                 duration = times[i] - current_start
                 if duration >= min_duration:
                     chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
-                # Si es muy corto, se descarta (era ruido)
             current_chord = chord
             current_start = times[i] if i < len(times) else current_start
 
@@ -309,7 +335,7 @@ def detect_chords(audio_path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Paso 3: Sincronizacion letras + acordes
 # ---------------------------------------------------------------------------
-def _split_long_segments(segments: list[dict], max_len: int = 50, min_len: int = 18) -> list[dict]:
+def _split_long_segments(segments: list[dict], max_len: int = 40, min_len: int = 15) -> list[dict]:
     """Divide segmentos largos en lineas mas cortas, respetando frases naturales."""
     result = []
     for seg in segments:
@@ -469,6 +495,14 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
 
     all_chords = [c["chord"] for c in chords_data if c.get("chord")]
     detected_key, key_type = _detect_key(all_chords)
+
+    # Renombrar enarmonicos: A# -> Bb, D# -> Eb, etc. segun tonalidad
+    if _use_flats(detected_key, key_type):
+        detected_key = _to_flat(detected_key)
+        for section in sections:
+            for line in section["lines"]:
+                for chord in line["chords"]:
+                    chord["chord"] = _to_flat(chord["chord"])
 
     return {"sections": sections, "detectedKey": detected_key, "keyType": key_type}
 
