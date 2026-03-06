@@ -127,6 +127,8 @@ async def process_audio(
 WHISPER_PROMPT = (
     "Cancion cristiana catolica en espanol. "
     "Letra de alabanza, adoracion y musica liturgica. "
+    "La cancion tiene versos y coros que se repiten varias veces. "
+    "Transcribir todas las repeticiones completas. "
     "Señor, Dios, Jesús, Cristo, Espíritu Santo, María, aleluya, amén, "
     "cordero, gloria, bendito, misericordia, alabanza, adoración."
 )
@@ -307,58 +309,91 @@ def detect_chords(audio_path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Paso 3: Sincronizacion letras + acordes
 # ---------------------------------------------------------------------------
+def _split_long_segments(segments: list[dict], max_len: int = 50, min_len: int = 18) -> list[dict]:
+    """Divide segmentos largos en lineas mas cortas, respetando frases naturales."""
+    result = []
+    for seg in segments:
+        text = seg["text"].strip()
+        if len(text) <= max_len:
+            result.append(seg)
+            continue
+
+        duration = seg["end"] - seg["start"]
+
+        # Buscar puntos de corte naturales: comas, puntos, punto y coma
+        split_chars = {",", ".", ";", "?", "!"}
+        candidates: list[int] = []
+        for idx, ch in enumerate(text):
+            if ch in split_chars and idx > 0:
+                candidates.append(idx + 1)  # incluir el signo de puntuacion
+
+        # Generar partes cortando en los puntos naturales
+        parts: list[str] = []
+        start_idx = 0
+        for cut in candidates:
+            part = text[start_idx:cut].strip()
+            rest = text[cut:].strip()
+            # Solo cortar si ambos lados quedan con longitud razonable
+            if len(part) >= min_len and len(rest) >= min_len:
+                parts.append(part)
+                start_idx = cut
+
+        # Agregar lo que quede
+        remaining = text[start_idx:].strip()
+        if remaining:
+            # Si lo que queda es muy largo, cortar por palabras
+            if len(remaining) > max_len:
+                words = remaining.split()
+                current = ""
+                for w in words:
+                    test = (current + " " + w).strip()
+                    if len(test) > max_len and len(current) >= min_len:
+                        parts.append(current)
+                        current = w
+                    else:
+                        current = test
+                if current:
+                    # No dejar fragmentos muy cortos solos
+                    if len(current) < min_len and parts:
+                        parts[-1] = parts[-1] + " " + current
+                    else:
+                        parts.append(current)
+            else:
+                # Si es corto pero hay partes previas y es muy pequeno, pegarlo a la anterior
+                if len(remaining) < min_len and parts:
+                    parts[-1] = parts[-1] + " " + remaining
+                else:
+                    parts.append(remaining)
+
+        if len(parts) <= 1:
+            result.append(seg)
+            continue
+
+        # Distribuir tiempos proporcionalmente
+        total_chars = sum(len(p) for p in parts)
+        time_cursor = seg["start"]
+        for part in parts:
+            part_dur = duration * (len(part) / max(total_chars, 1))
+            result.append({
+                "text": part.strip(),
+                "start": round(time_cursor, 3),
+                "end": round(time_cursor + part_dur, 3),
+            })
+            time_cursor += part_dur
+
+    return result
+
+
 def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
     """Cruza letras (con tiempos) y acordes (con tiempos) en secciones estructuradas."""
     segments = lyrics_data["segments"]
     if not segments:
         return {"sections": [], "detectedKey": "C", "keyType": "major"}
 
-    # --- Paso A: Dividir segmentos largos en lineas mas cortas ---
-    MAX_LINE_LEN = 45  # caracteres maximos por linea
-    split_segments = []
-    for seg in segments:
-        text = seg["text"].strip()
-        if len(text) <= MAX_LINE_LEN:
-            split_segments.append(seg)
-            continue
+    # Paso A: Dividir segmentos largos respetando frases naturales
+    segments = _split_long_segments(segments)
 
-        # Dividir por comas o puntos naturales
-        duration = seg["end"] - seg["start"]
-        parts: list[str] = []
-        current_part = ""
-        for word in text.split():
-            test = (current_part + " " + word).strip()
-            if len(test) > MAX_LINE_LEN and current_part:
-                parts.append(current_part)
-                current_part = word
-            else:
-                current_part = test
-            # Tambien cortar en comas si ya es suficientemente largo
-            if current_part.endswith(",") and len(current_part) > 15:
-                parts.append(current_part)
-                current_part = ""
-        if current_part:
-            parts.append(current_part)
-
-        if not parts:
-            split_segments.append(seg)
-            continue
-
-        # Distribuir el tiempo proporcionalmente al largo del texto
-        total_chars = sum(len(p) for p in parts)
-        time_cursor = seg["start"]
-        for part in parts:
-            part_duration = duration * (len(part) / max(total_chars, 1))
-            split_segments.append({
-                "text": part.strip(),
-                "start": round(time_cursor, 3),
-                "end": round(time_cursor + part_duration, 3),
-            })
-            time_cursor += part_duration
-
-    segments = split_segments
-
-    # --- Paso B: Asignar acordes a cada linea ---
+    # Paso B: Asignar acordes a cada linea
     sections: list[dict] = []
     current_lines: list[dict] = []
     section_counter = 1
@@ -366,10 +401,10 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
     for i, seg in enumerate(segments):
         seg_chords: list[dict] = []
 
-        # (Ajuste 2) Acorde activo justo antes de esta linea -> ponerlo al inicio
+        # Acorde activo al inicio: el ultimo acorde que suena ANTES o AL INICIO de esta linea
         last_before = None
         for chord_ev in chords_data:
-            if chord_ev["time"] < seg["start"]:
+            if chord_ev["time"] <= seg["start"]:
                 last_before = chord_ev
             else:
                 break
@@ -378,19 +413,17 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
 
         # Acordes que caen DENTRO del rango temporal de esta linea
         for chord_ev in chords_data:
-            if seg["start"] <= chord_ev["time"] < seg["end"]:
+            if seg["start"] < chord_ev["time"] < seg["end"]:
                 seg_duration = max(seg["end"] - seg["start"], 0.01)
                 relative_pos = (chord_ev["time"] - seg["start"]) / seg_duration
                 char_index = int(relative_pos * len(seg["text"]))
-                char_index = max(0, min(char_index, len(seg["text"])))
+                char_index = max(1, min(char_index, len(seg["text"]) - 1))
                 seg_chords.append({"chord": chord_ev["chord"], "charIndex": char_index})
 
-        # (Ajuste 3) Acordes entre el fin de esta linea y el inicio de la siguiente
-        # -> agregarlos al final de esta linea
-        next_start = segments[i + 1]["start"] if i < len(segments) - 1 else seg["end"] + 10
+        # Acordes entre el fin de esta linea y el inicio de la siguiente (intermedios)
+        next_start = segments[i + 1]["start"] if i < len(segments) - 1 else seg["end"] + 999
         for chord_ev in chords_data:
             if seg["end"] <= chord_ev["time"] < next_start:
-                # Ponerlo al final del texto
                 seg_chords.append({"chord": chord_ev["chord"], "charIndex": len(seg["text"])})
 
         # Deduplicar: quitar acordes repetidos consecutivos y misma posicion
