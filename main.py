@@ -425,10 +425,11 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     """
     Detecta acordes usando:
     1. HPSS (separacion armonica/percusiva) para aislar contenido tonal
-    2. Cromagrama CENS sobre la componente armonica (robusto para acordes)
-    3. Analisis sincronizado por beats (un acorde por beat)
-    4. Filtro de mediana para suavizar transiciones espurias
-    5. Dos pasadas: primera detecta tonalidad, segunda aplica sesgo diatonico
+    2. Cromagrama CQT sobre la componente armonica (buena resolucion armonica)
+    3. Analisis sincronizado por beats
+    4. Filtro de mediana suave + filtro de moda
+    5. Deteccion de tonalidad Krumhansl-Kessler + sesgo diatonico fuerte
+    6. Onset snapping para alinear cambios al momento real
     """
     import librosa
     from scipy.ndimage import median_filter
@@ -442,18 +443,28 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
     hop_length = 512
 
+    # Extraer chroma CQT (mejor resolucion armonica que CENS para guitarra/piano)
+    chroma_cqt = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=hop_length)
+
     if len(beat_frames) < 2:
         hop_length = 2048
-        chroma = librosa.feature.chroma_cens(y=y_harmonic, sr=sr, hop_length=hop_length)
+        chroma_cqt = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=hop_length)
+        chroma = chroma_cqt
         times = librosa.frames_to_time(range(chroma.shape[1]), sr=sr, hop_length=hop_length)
     else:
-        chroma_full = librosa.feature.chroma_cens(y=y_harmonic, sr=sr, hop_length=hop_length)
-        chroma = librosa.util.sync(chroma_full, beat_frames, aggregate=np.median)
+        chroma = librosa.util.sync(chroma_cqt, beat_frames, aggregate=np.median)
         times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
 
-    # Filtro de mediana temporal
-    if chroma.shape[1] > 5:
-        chroma = median_filter(chroma, size=(1, 5))
+    # Detectar onsets armonicos para snap posterior
+    onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr, hop_length=hop_length)
+    onset_frames = librosa.onset.onset_detect(
+        y=y_harmonic, sr=sr, hop_length=hop_length, onset_envelope=onset_env,
+    )
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+
+    # Filtro de mediana temporal (3 para preservar mas detalle)
+    if chroma.shape[1] > 3:
+        chroma = median_filter(chroma, size=(1, 3))
 
     # Normalizar cada frame
     norms = np.linalg.norm(chroma, axis=0, keepdims=True) + 1e-10
@@ -505,22 +516,22 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
             bonus[name] = -0.12
     raw_chords: list[str | None] = [_classify_frame(i, bonus) for i in range(chroma.shape[1])]
 
-    # Filtro de moda sobre la secuencia (mediana no aplica a datos categoricos)
-    if len(raw_chords) > 5:
+    # Filtro de moda sobre la secuencia (ventana 3 para preservar detalle)
+    if len(raw_chords) > 3:
         from collections import Counter
         smoothed = list(raw_chords)
-        half = 2
+        half = 1
         for i in range(len(raw_chords)):
             window = raw_chords[max(0, i - half):min(len(raw_chords), i + half + 1)]
             counter = Counter(window)
             smoothed[i] = counter.most_common(1)[0][0]
         raw_chords = smoothed
 
-    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima 1.0s
+    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima 0.5s
     chord_events: list[dict] = []
     current_chord: str | None = None
     current_start = 0.0
-    min_duration = 1.0
+    min_duration = 0.5
 
     for i, chord in enumerate(raw_chords):
         if chord != current_chord:
@@ -534,7 +545,15 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     if current_chord is not None:
         chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
 
-    logger.info("Acordes detectados (Librosa fallback): %d eventos", len(chord_events))
+    # Snap cada cambio de acorde al onset armonico mas cercano (mejora timing)
+    if len(onset_times) > 0:
+        for event in chord_events:
+            closest_idx = np.argmin(np.abs(onset_times - event["time"]))
+            # Solo snap si el onset esta dentro de 0.3s del evento
+            if abs(onset_times[closest_idx] - event["time"]) < 0.3:
+                event["time"] = round(float(onset_times[closest_idx]), 2)
+
+    logger.info("Acordes detectados (Librosa): %d eventos", len(chord_events))
     return chord_events
 
 
