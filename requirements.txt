@@ -6,4 +6,3 @@ librosa>=0.10.0
 numpy>=1.23.0,<2
 scipy>=1.10.0
 soundfile>=0.12.0
-essentia>=2.1b6
