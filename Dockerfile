@@ -1,9 +1,13 @@
 FROM python:3.11-slim
 
-# Instalar ffmpeg (requerido por librosa para decodificar audio)
+# Instalar ffmpeg y dependencias de sistema para Essentia + Librosa
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
+    libfftw3-3 \
+    libyaml-0-2 \
+    libchromaprint1 \
+    libtag1v5 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

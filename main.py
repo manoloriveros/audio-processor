@@ -1,7 +1,7 @@
 """
 Audio Processor - Servicio de extraccion de letras y acordes.
 Recibe un archivo de audio, transcribe la letra con Whisper (OpenAI)
-y detecta los acordes con Librosa (HPSS + beat-sync + plantillas extendidas).
+y detecta los acordes con Essentia (HPCP + ChordsDetection), con fallback a Librosa.
 """
 
 import os
@@ -30,6 +30,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Verificar disponibilidad de Essentia
+# ---------------------------------------------------------------------------
+_ESSENTIA_AVAILABLE = False
+try:
+    import essentia
+    import essentia.standard as _es_std
+    _ESSENTIA_AVAILABLE = True
+    logger.info("Motor de acordes: Essentia (HPCP + ChordsDetection)")
+except ImportError:
+    logger.warning("Essentia no disponible — se usara Librosa como fallback")
 
 # ---------------------------------------------------------------------------
 # Plantillas de acordes (mayor, menor, 7)
@@ -101,7 +113,7 @@ for _i, _note in enumerate(NOTES):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "engine": "essentia" if _ESSENTIA_AVAILABLE else "librosa"}
 
 
 @app.post("/process")
@@ -178,7 +190,7 @@ def transcribe_with_whisper(audio_path: str) -> dict:
             model="whisper-1",
             file=f,
             response_format="verbose_json",
-            timestamp_granularities=["segment"],
+            timestamp_granularities=["word", "segment"],
             language="es",
             prompt=WHISPER_PROMPT,
         )
@@ -213,13 +225,176 @@ def transcribe_with_whisper(audio_path: str) -> dict:
         for i, sentence in enumerate(sentences):
             segments.append({"text": sentence, "start": 0, "end": 0})
 
-    return {"text": full_text, "segments": segments}
+    # Extraer palabras con timestamps individuales
+    words: list[dict] = []
+    raw_words = None
+    if hasattr(response, "words"):
+        raw_words = response.words
+    elif isinstance(response, dict) and "words" in response:
+        raw_words = response["words"]
+
+    if raw_words:
+        for w in raw_words:
+            w_text = w["word"] if isinstance(w, dict) else getattr(w, "word", "")
+            w_start = w["start"] if isinstance(w, dict) else getattr(w, "start", 0)
+            w_end = w["end"] if isinstance(w, dict) else getattr(w, "end", 0)
+            w_text = w_text.strip()
+            if w_text:
+                words.append({"word": w_text, "start": w_start, "end": w_end})
+
+    logger.info("Whisper: %d segmentos, %d palabras con timestamps", len(segments), len(words))
+    return {"text": full_text, "segments": segments, "words": words}
 
 
 # ---------------------------------------------------------------------------
-# Paso 2: Deteccion de acordes con Librosa (mejorada)
+# Paso 2A: Deteccion de acordes con Essentia (primario)
 # ---------------------------------------------------------------------------
-def detect_chords(audio_path: str) -> list[dict]:
+def _detect_chords_essentia(audio_path: str) -> list[dict]:
+    """
+    Detecta acordes usando Essentia:
+    1. HPCP (36-bin Harmonic Pitch Class Profile) — mejor resolucion que chroma
+    2. ChordsDetection con plantillas Gaussianas (mayor, menor, dim, aug)
+    3. Post-proceso para detectar septimas desde HPCP
+    4. min_duration adaptativo segun tempo
+    """
+    import essentia
+    import essentia.standard as es
+
+    sr = 44100
+    audio = es.MonoLoader(filename=audio_path, sampleRate=sr)()
+
+    if len(audio) < sr:  # Menos de 1 segundo
+        return []
+
+    # --- Detectar tempo para min_duration adaptativo ---
+    try:
+        bpm = es.RhythmExtractor2013(method="multifeature")(audio)[0]
+    except Exception:
+        bpm = 120.0
+    beat_dur = 60.0 / max(bpm, 60)
+    logger.info("Tempo (Essentia): %.1f BPM (beat=%.2fs)", bpm, beat_dur)
+
+    # --- Extraccion HPCP frame a frame ---
+    frame_size = 8192   # ~186ms a 44100Hz — buena resolucion para acordes
+    hop_size = 2048     # ~46ms
+
+    win = es.Windowing(type="blackmanharris62")
+    spec_algo = es.Spectrum()
+    peaks_algo = es.SpectralPeaks(
+        orderBy="magnitude",
+        magnitudeThreshold=1e-5,
+        minFrequency=40,
+        maxFrequency=5000,
+        maxPeaks=100,
+        sampleRate=sr,
+    )
+    hpcp_algo = es.HPCP(
+        size=36,
+        referenceFrequency=440,
+        harmonics=8,
+        bandPreset=True,
+        minFrequency=40,
+        maxFrequency=5000,
+        weightType="cosine",
+        nonLinear=False,
+        windowSize=1.0,
+        sampleRate=sr,
+    )
+
+    hpcp_frames = []
+    for frame in es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size):
+        s = spec_algo(win(frame))
+        f, m = peaks_algo(s)
+        hpcp_frames.append(hpcp_algo(f, m))
+
+    if not hpcp_frames:
+        return []
+
+    hpcp_array = np.array(hpcp_frames)  # shape: (n_frames, 36)
+    n_frames = hpcp_array.shape[0]
+    times = np.arange(n_frames) * hop_size / sr
+
+    # --- ChordsDetection: plantillas Gaussianas sobre HPCP 36-bin ---
+    chords_det = es.ChordsDetection(hopSize=hop_size, sampleRate=sr, windowSize=2)
+    chords, strengths = chords_det(hpcp_array)
+
+    # --- Post-proceso: detectar septimas desde HPCP ---
+    # Reducir HPCP 36-bin a 12-bin para analisis de intervalos
+    hpcp_12 = np.zeros((n_frames, 12))
+    for i in range(n_frames):
+        for j in range(12):
+            hpcp_12[i, j] = np.mean(hpcp_array[i, j * 3 : (j + 1) * 3])
+
+    NOTE_TO_IDX = {n: idx for idx, n in enumerate(NOTES)}
+
+    enhanced_chords: list[str] = []
+    for i in range(len(chords)):
+        chord = chords[i]
+        if chord == "N" or i >= n_frames:
+            enhanced_chords.append(chord)
+            continue
+
+        # Parsear raiz y calidad
+        is_minor = chord.endswith("m") and not chord.endswith("dim")
+        root = chord[:-1] if is_minor else chord
+        root = root.replace("dim", "").replace("aug", "")
+
+        if root not in NOTE_TO_IDX:
+            enhanced_chords.append(chord)
+            continue
+
+        root_idx = NOTE_TO_IDX[root]
+        m7_idx = (root_idx + 10) % 12  # 10 semitonos = 7ma menor
+        root_energy = hpcp_12[i, root_idx]
+        m7_energy = hpcp_12[i, m7_idx]
+
+        # Si la 7ma menor tiene energia significativa relativa a la raiz
+        if root_energy > 0.01 and m7_energy / (root_energy + 1e-10) > 0.35:
+            if is_minor:
+                enhanced_chords.append(root + "m7")
+            elif not any(chord.endswith(s) for s in ("dim", "aug")):
+                enhanced_chords.append(chord + "7")
+            else:
+                enhanced_chords.append(chord)
+        else:
+            enhanced_chords.append(chord)
+
+    # --- Generar eventos con min_duration adaptativo ---
+    chord_events: list[dict] = []
+    current_chord: str | None = None
+    current_start = 0.0
+    min_duration = max(0.5, beat_dur * 0.75)  # ~75% de un beat, minimo 0.5s
+
+    for i, chord in enumerate(enhanced_chords):
+        t = times[i] if i < len(times) else times[-1]
+
+        if chord == "N":
+            if current_chord is not None:
+                dur = t - current_start
+                if dur >= min_duration:
+                    chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
+                current_chord = None
+            continue
+
+        if chord != current_chord:
+            if current_chord is not None:
+                dur = t - current_start
+                if dur >= min_duration:
+                    chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
+            current_chord = chord
+            current_start = t
+
+    if current_chord is not None:
+        chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
+
+    logger.info("Acordes (Essentia): %d eventos", len(chord_events))
+    return chord_events
+
+
+# ---------------------------------------------------------------------------
+# Paso 2B: Deteccion de acordes con Librosa (fallback)
+# ---------------------------------------------------------------------------
+def _detect_chords_librosa(audio_path: str) -> list[dict]:
     """
     Detecta acordes usando:
     1. HPSS (separacion armonica/percusiva) para aislar contenido tonal
@@ -328,8 +503,21 @@ def detect_chords(audio_path: str) -> list[dict]:
     if current_chord is not None:
         chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
 
-    logger.info("Acordes detectados: %d eventos", len(chord_events))
+    logger.info("Acordes detectados (Librosa fallback): %d eventos", len(chord_events))
     return chord_events
+
+
+# ---------------------------------------------------------------------------
+# Paso 2: Wrapper — Essentia primario, Librosa fallback
+# ---------------------------------------------------------------------------
+def detect_chords(audio_path: str) -> list[dict]:
+    """Detecta acordes: intenta Essentia primero, Librosa como fallback."""
+    if _ESSENTIA_AVAILABLE:
+        try:
+            return _detect_chords_essentia(audio_path)
+        except Exception as e:
+            logger.error("Error en Essentia chord detection: %s — fallback a Librosa", e, exc_info=True)
+    return _detect_chords_librosa(audio_path)
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +598,66 @@ def _split_long_segments(segments: list[dict], max_len: int = 40, min_len: int =
     return result
 
 
+def _time_to_char_index(
+    chord_time: float,
+    line_text: str,
+    line_start: float,
+    line_end: float,
+    words: list[dict],
+) -> int:
+    """Mapea timestamp de acorde a indice de caracter usando posiciones de palabras.
+
+    Si hay words con timestamps disponibles, busca la palabra mas cercana al
+    momento del acorde y calcula el charIndex real.  Fallback: interpolacion lineal.
+    """
+    # Filtrar palabras que pertenecen a esta linea (con tolerancia de 0.1s)
+    line_words = [
+        w for w in words
+        if w["start"] >= line_start - 0.1 and w["end"] <= line_end + 0.1
+    ]
+
+    if not line_words:
+        # Fallback: interpolacion lineal
+        seg_dur = max(line_end - line_start, 0.01)
+        rel = (chord_time - line_start) / seg_dur
+        return max(1, min(int(rel * len(line_text)), len(line_text) - 1))
+
+    # Mapear cada palabra a su posicion de caracter en line_text
+    search_from = 0
+    word_positions: list[dict] = []
+    text_lower = line_text.lower()
+    for w in line_words:
+        clean = w["word"].strip()
+        pos = text_lower.find(clean.lower(), search_from)
+        if pos == -1:
+            pos = search_from
+        word_positions.append({
+            "char_start": pos,
+            "char_end": pos + len(clean),
+            "time_start": w["start"],
+            "time_end": w["end"],
+        })
+        search_from = pos + len(clean)
+
+    # Buscar la palabra donde cae el acorde
+    for wp in word_positions:
+        if chord_time <= wp["time_start"]:
+            return max(1, wp["char_start"])
+        if wp["time_start"] <= chord_time <= wp["time_end"]:
+            # Interpolar dentro de la palabra
+            word_dur = max(wp["time_end"] - wp["time_start"], 0.01)
+            progress = (chord_time - wp["time_start"]) / word_dur
+            char_within = int(progress * (wp["char_end"] - wp["char_start"]))
+            return max(1, min(wp["char_start"] + char_within, len(line_text) - 1))
+
+    # El acorde cae despues de todas las palabras
+    return max(1, min(word_positions[-1]["char_end"], len(line_text) - 1))
+
+
 def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
     """Cruza letras (con tiempos) y acordes (con tiempos) en secciones estructuradas."""
     segments = lyrics_data["segments"]
+    words = lyrics_data.get("words", [])
     if not segments:
         return {"sections": [], "detectedKey": "C", "keyType": "major"}
 
@@ -440,10 +685,9 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
         # Acordes que caen DENTRO del rango temporal de esta linea
         for chord_ev in chords_data:
             if seg["start"] < chord_ev["time"] < seg["end"]:
-                seg_duration = max(seg["end"] - seg["start"], 0.01)
-                relative_pos = (chord_ev["time"] - seg["start"]) / seg_duration
-                char_index = int(relative_pos * len(seg["text"]))
-                char_index = max(1, min(char_index, len(seg["text"]) - 1))
+                char_index = _time_to_char_index(
+                    chord_ev["time"], seg["text"], seg["start"], seg["end"], words,
+                )
                 seg_chords.append({"chord": chord_ev["chord"], "charIndex": char_index})
 
         # Acordes entre el fin de esta linea y el inicio de la siguiente (intermedios)
