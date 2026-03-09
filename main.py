@@ -104,8 +104,8 @@ for _i, _note in enumerate(NOTES):
     CHORD_TEMPLATES[_note] = _build_template(_i, [(0, 1.0), (4, 0.8), (7, 0.8)])
     # Menor: 1 - 3m - 5J
     CHORD_TEMPLATES[f"{_note}m"] = _build_template(_i, [(0, 1.0), (3, 0.8), (7, 0.8)])
-    # Septima dominante: 1 - 3M - 5J - 7m
-    CHORD_TEMPLATES[f"{_note}7"] = _build_template(_i, [(0, 1.0), (4, 0.7), (7, 0.7), (10, 0.5)])
+    # Septima dominante: 1 - 3M - 5J - 7m (pesos bajos para evitar falsos positivos)
+    CHORD_TEMPLATES[f"{_note}7"] = _build_template(_i, [(0, 1.0), (4, 0.5), (7, 0.5), (10, 0.3)])
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +349,7 @@ def _detect_chords_essentia(audio_path: str) -> list[dict]:
         m7_energy = hpcp_12[i, m7_idx]
 
         # Si la 7ma menor tiene energia significativa relativa a la raiz
-        if root_energy > 0.01 and m7_energy / (root_energy + 1e-10) > 0.35:
+        if root_energy > 0.01 and m7_energy / (root_energy + 1e-10) > 0.60:
             if is_minor:
                 enhanced_chords.append(root + "m7")
             elif not any(chord.endswith(s) for s in ("dim", "aug")):
@@ -389,6 +389,33 @@ def _detect_chords_essentia(audio_path: str) -> list[dict]:
 
     logger.info("Acordes (Essentia): %d eventos", len(chord_events))
     return chord_events
+
+
+# ---------------------------------------------------------------------------
+# Deteccion de tonalidad desde cromagrama (Krumhansl-Kessler)
+# ---------------------------------------------------------------------------
+def _detect_key_from_chroma(chroma: np.ndarray) -> tuple[str, str]:
+    """Detecta tonalidad usando perfiles Krumhansl-Kessler sobre el cromagrama global."""
+    major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+    minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+    chroma_sum = np.sum(chroma, axis=1)
+    chroma_sum = chroma_sum / (np.linalg.norm(chroma_sum) + 1e-10)
+
+    best_key = 0
+    best_type = "major"
+    best_corr = -1.0
+
+    for shift in range(12):
+        shifted = np.roll(chroma_sum, -shift)
+        corr_maj = np.corrcoef(shifted, major_profile)[0, 1]
+        if corr_maj > best_corr:
+            best_corr, best_key, best_type = corr_maj, shift, "major"
+        corr_min = np.corrcoef(shifted, minor_profile)[0, 1]
+        if corr_min > best_corr:
+            best_corr, best_key, best_type = corr_min, shift, "minor"
+
+    return NOTES[best_key], best_type
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +467,7 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     ])
 
     BASIC_CHORDS = {n for n in template_names if not n.endswith("7")}
-    EXTENDED_BONUS = 0.15
+    EXTENDED_BONUS = 0.35
     scores = template_matrix @ chroma_norm
 
     def _classify_frame(frame_idx: int, diatonic_bonus: dict[str, float] | None = None):
@@ -448,7 +475,7 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
         if diatonic_bonus:
             for j, name in enumerate(template_names):
                 frame_scores[j] += diatonic_bonus.get(name, 0.0)
-        if np.max(frame_scores) < 0.55:
+        if np.max(frame_scores) < 0.60:
             return None
         best_basic_score, best_basic = -1.0, None
         best_ext_score, best_ext = -1.0, None
@@ -464,32 +491,36 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
             return best_ext
         return best_basic
 
-    # --- Pasada 1: clasificacion sin sesgo -> detectar tonalidad ---
-    raw_pass1 = [_classify_frame(i) for i in range(chroma.shape[1])]
-    names_pass1 = [c for c in raw_pass1 if c is not None]
-    det_key, det_type = _detect_key(names_pass1)
+    # --- Detectar tonalidad desde cromagrama (Krumhansl-Kessler) ---
+    det_key, det_type = _detect_key_from_chroma(chroma)
     diatonic = _build_diatonic_set(det_key, det_type)
-    logger.info("Tonalidad detectada (pasada 1): %s %s, diatonicos: %s", det_key, det_type, diatonic)
+    logger.info("Tonalidad detectada (K-K): %s %s, diatonicos: %s", det_key, det_type, diatonic)
 
-    # --- Pasada 2: clasificacion con sesgo diatonico ---
-    bonus = {name: 0.08 for name in diatonic}
+    # --- Clasificacion con sesgo diatonico fuerte ---
+    bonus: dict[str, float] = {}
+    for name in template_names:
+        if name in diatonic:
+            bonus[name] = 0.20
+        else:
+            bonus[name] = -0.12
     raw_chords: list[str | None] = [_classify_frame(i, bonus) for i in range(chroma.shape[1])]
 
-    # Filtro de mediana sobre la secuencia
-    chord_to_idx = {name: idx for idx, name in enumerate(template_names)}
-    chord_to_idx[None] = -1
-    idx_sequence = np.array([chord_to_idx.get(c, -1) for c in raw_chords])
+    # Filtro de moda sobre la secuencia (mediana no aplica a datos categoricos)
+    if len(raw_chords) > 5:
+        from collections import Counter
+        smoothed = list(raw_chords)
+        half = 2
+        for i in range(len(raw_chords)):
+            window = raw_chords[max(0, i - half):min(len(raw_chords), i + half + 1)]
+            counter = Counter(window)
+            smoothed[i] = counter.most_common(1)[0][0]
+        raw_chords = smoothed
 
-    if len(idx_sequence) > 5:
-        filtered = median_filter(idx_sequence.astype(float), size=5).astype(int)
-        idx_to_chord = {idx: name for name, idx in chord_to_idx.items()}
-        raw_chords = [idx_to_chord.get(int(idx)) for idx in filtered]
-
-    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima 2.0s
+    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima 1.0s
     chord_events: list[dict] = []
     current_chord: str | None = None
     current_start = 0.0
-    min_duration = 2.0
+    min_duration = 1.0
 
     for i, chord in enumerate(raw_chords):
         if chord != current_chord:
@@ -708,12 +739,10 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
                 unique_chords.append(c)
                 prev_chord_name = c["chord"]
 
-        # Limitar a maximo 3 acordes por linea
-        if len(unique_chords) > 3:
-            first = unique_chords[0]
-            last = unique_chords[-1]
-            mid = unique_chords[len(unique_chords) // 2]
-            unique_chords = [first, mid, last]
+        # Limitar a maximo 6 acordes por linea
+        if len(unique_chords) > 6:
+            step = len(unique_chords) / 6
+            unique_chords = [unique_chords[int(i * step)] for i in range(6)]
 
         current_lines.append({
             "lyrics": seg["text"],
