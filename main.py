@@ -739,6 +739,20 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
                 unique_chords.append(c)
                 prev_chord_name = c["chord"]
 
+        # Enforcar espaciado minimo para evitar superposicion visual
+        if len(unique_chords) > 1:
+            spaced = [unique_chords[0]]
+            for c in unique_chords[1:]:
+                prev = spaced[-1]
+                min_pos = prev["charIndex"] + len(prev["chord"]) + 2
+                if c["charIndex"] < min_pos:
+                    if min_pos < len(seg["text"]):
+                        spaced.append({**c, "charIndex": min_pos})
+                    # sin espacio: descartar este acorde
+                else:
+                    spaced.append(c)
+            unique_chords = spaced
+
         # Limitar a maximo 6 acordes por linea
         if len(unique_chords) > 6:
             step = len(unique_chords) / 6
