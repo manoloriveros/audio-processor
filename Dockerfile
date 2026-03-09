@@ -13,10 +13,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Essentia: instalar best-effort (no hay release estable para Python 3.11)
-# Si falla, el servicio usa Librosa como fallback automaticamente
-RUN pip install --no-cache-dir essentia==2.1b6.dev1389 || true
-
 COPY main.py .
 
 EXPOSE 8000
