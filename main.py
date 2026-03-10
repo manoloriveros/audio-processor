@@ -782,6 +782,15 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
             step = len(unique_chords) / 6
             unique_chords = [unique_chords[int(i * step)] for i in range(6)]
 
+        # Eliminar primer acorde si es igual al ultimo de la linea anterior
+        # (se sobreentiende que sigue sonando desde la linea previa)
+        if unique_chords and current_lines:
+            prev_line_chords = current_lines[-1]["chords"]
+            if (prev_line_chords
+                    and unique_chords[0]["charIndex"] == 0
+                    and unique_chords[0]["chord"] == prev_line_chords[-1]["chord"]):
+                unique_chords = unique_chords[1:]
+
         current_lines.append({
             "lyrics": seg["text"],
             "chords": unique_chords,
