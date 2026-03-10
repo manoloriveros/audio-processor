@@ -83,23 +83,30 @@ def _use_flats(key: str, key_type: str) -> bool:
 
 
 def _build_diatonic_set(key: str, key_type: str) -> set[str]:
-    """Construye el conjunto de acordes diatonicos para una tonalidad."""
+    """Construye el conjunto de acordes diatonicos para una tonalidad.
+
+    Excluye ii° (menor) y vii° (mayor) porque los acordes disminuidos
+    practicamente no aparecen en musica popular/liturgica, y su inclusion
+    como acordes mayores generaba falsos positivos (ej. E mayor en Dm).
+    """
     key_idx = NOTES.index(key) if key in NOTES else 0
     if key_type == "minor":
-        intervals = [0, 2, 3, 5, 7, 8, 10]
-        qualities = ["m", "", "", "m", "m", "", ""]
+        # i, III, iv, v, VI, VII  (sin ii°)
+        intervals_q = [(0, "m"), (3, ""), (5, "m"), (7, "m"), (8, ""), (10, "")]
     else:
-        intervals = [0, 2, 4, 5, 7, 9, 11]
-        qualities = ["", "m", "m", "", "", "m", ""]
+        # I, ii, iii, IV, V, vi  (sin vii°)
+        intervals_q = [(0, ""), (2, "m"), (4, "m"), (5, ""), (7, ""), (9, "m")]
 
     diatonic = set()
-    for iv, q in zip(intervals, qualities):
+    for iv, q in intervals_q:
         note = NOTES[(key_idx + iv) % 12]
         diatonic.add(note + q)
-        if iv == 7:  # V7 es comun en ambos modos
-            diatonic.add(note + "7")
-            if key_type == "minor":
-                diatonic.add(note)  # V mayor en menor armonico
+
+    # V7 es comun en ambos modos; V mayor en menor armonico
+    v_note = NOTES[(key_idx + 7) % 12]
+    diatonic.add(v_note + "7")
+    if key_type == "minor":
+        diatonic.add(v_note)  # V mayor (menor armonico)
     return diatonic
 
 
@@ -354,7 +361,7 @@ def _detect_chords_essentia(audio_path: str) -> list[dict]:
         m7_energy = hpcp_12[i, m7_idx]
 
         # Si la 7ma menor tiene energia significativa relativa a la raiz
-        if root_energy > 0.01 and m7_energy / (root_energy + 1e-10) > 0.60:
+        if root_energy > 0.01 and m7_energy / (root_energy + 1e-10) > 0.70:
             if is_minor:
                 enhanced_chords.append(root + "m7")
             elif not any(chord.endswith(s) for s in ("dim", "aug")):
@@ -363,6 +370,18 @@ def _detect_chords_essentia(audio_path: str) -> list[dict]:
                 enhanced_chords.append(chord)
         else:
             enhanced_chords.append(chord)
+
+    # --- Suavizado: filtro de moda (ventana ~400ms a 46ms/frame) ---
+    if len(enhanced_chords) > 9:
+        from collections import Counter
+        smoothed_e = list(enhanced_chords)
+        half_e = 4  # ventana de 9 frames ≈ 414ms
+        for idx_e in range(len(enhanced_chords)):
+            win = enhanced_chords[max(0, idx_e - half_e):min(len(enhanced_chords), idx_e + half_e + 1)]
+            non_null = [c for c in win if c != "N"]
+            if non_null and enhanced_chords[idx_e] != "N":
+                smoothed_e[idx_e] = Counter(non_null).most_common(1)[0][0]
+        enhanced_chords = smoothed_e
 
     # --- Generar eventos con min_duration adaptativo ---
     chord_events: list[dict] = []
@@ -516,27 +535,32 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     bonus: dict[str, float] = {}
     for name in template_names:
         if name in diatonic:
-            bonus[name] = 0.20
+            bonus[name] = 0.25
         else:
-            bonus[name] = -0.12
+            bonus[name] = -0.15
     raw_chords: list[str | None] = [_classify_frame(i, bonus) for i in range(chroma.shape[1])]
 
-    # Filtro de moda sobre la secuencia (ventana 3 para preservar detalle)
+    # Filtro de moda sobre la secuencia (ventana 3 por beat, excluyendo None)
     if len(raw_chords) > 3:
         from collections import Counter
         smoothed = list(raw_chords)
         half = 1
         for i in range(len(raw_chords)):
             window = raw_chords[max(0, i - half):min(len(raw_chords), i + half + 1)]
-            counter = Counter(window)
-            smoothed[i] = counter.most_common(1)[0][0]
+            non_null = [c for c in window if c is not None]
+            if non_null:
+                smoothed[i] = Counter(non_null).most_common(1)[0][0]
         raw_chords = smoothed
 
-    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima 0.5s
+    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima adaptativa
+    _tempo_val = float(np.atleast_1d(tempo)[0]) if hasattr(tempo, '__len__') else float(tempo)
+    beat_dur = 60.0 / max(_tempo_val, 60)
+    min_duration = max(0.5, beat_dur * 0.75)
+    logger.info("Tempo (Librosa): %.1f BPM, min_duration: %.2fs", _tempo_val, min_duration)
+
     chord_events: list[dict] = []
     current_chord: str | None = None
     current_start = 0.0
-    min_duration = 0.5
 
     for i, chord in enumerate(raw_chords):
         if chord != current_chord:
@@ -563,16 +587,135 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Paso 2: Wrapper — Essentia primario, Librosa fallback
+# Paso 2: Wrapper — Essentia primario, Librosa fallback + post-proceso
 # ---------------------------------------------------------------------------
 def detect_chords(audio_path: str) -> list[dict]:
-    """Detecta acordes: intenta Essentia primero, Librosa como fallback."""
+    """Detecta acordes: intenta Essentia primero, Librosa como fallback.
+    Aplica post-proceso diatonico y eliminacion de ruido al resultado."""
+    events = None
     if _ESSENTIA_AVAILABLE:
         try:
-            return _detect_chords_essentia(audio_path)
+            events = _detect_chords_essentia(audio_path)
         except Exception as e:
             logger.error("Error en Essentia chord detection: %s — fallback a Librosa", e, exc_info=True)
-    return _detect_chords_librosa(audio_path)
+    if events is None:
+        events = _detect_chords_librosa(audio_path)
+
+    events = _postprocess_chord_events(events)
+    return events
+
+
+def _find_nearest_diatonic(chord: str, diatonic: set[str]) -> str | None:
+    """Encuentra el acorde diatonico mas cercano a uno no diatonico.
+
+    Busca por proximidad de raiz (±1-2 semitonos) manteniendo la calidad,
+    y como ultimo recurso prueba la calidad opuesta en la misma raiz.
+    """
+    is_m7 = chord.endswith("m7")
+    is_7 = chord.endswith("7") and not is_m7
+    is_minor = chord.endswith("m") and not is_m7 and not chord.endswith("dim")
+
+    if is_m7:
+        root = chord[:-2]
+        quality = "m"
+    elif is_7:
+        root = chord[:-1]
+        quality = ""
+    elif is_minor:
+        root = chord[:-1]
+        quality = "m"
+    else:
+        root = chord
+        quality = ""
+
+    if root not in NOTES:
+        return None
+
+    root_idx = NOTES.index(root)
+
+    # Buscar raices vecinas (±1-2 semitonos) con la misma calidad
+    for offset in [1, -1, 2, -2]:
+        candidate = NOTES[(root_idx + offset) % 12] + quality
+        if candidate in diatonic:
+            return candidate
+
+    # Intentar calidad opuesta en la misma raiz
+    alt_quality = "" if quality == "m" else "m"
+    alt_chord = root + alt_quality
+    if alt_chord in diatonic:
+        return alt_chord
+
+    return None
+
+
+def _postprocess_chord_events(chord_events: list[dict]) -> list[dict]:
+    """Post-procesa eventos de acordes:
+    1. Correccion diatonica: reemplaza no diatonicos breves por el mas cercano
+    2. Eliminacion de parpadeos: quita cambios A→B→A donde B dura < 1s
+    3. Fusion de consecutivos iguales tras correcciones
+    """
+    if len(chord_events) < 2:
+        return chord_events
+
+    # Detectar tonalidad desde la frecuencia de acordes
+    all_names = [e["chord"] for e in chord_events]
+    det_key, det_type = _detect_key(all_names)
+    diatonic = _build_diatonic_set(det_key, det_type)
+    logger.info(
+        "Post-proceso: tonalidad %s %s, diatonicos: %s",
+        det_key, det_type, sorted(diatonic),
+    )
+
+    # Calcular duracion de cada evento
+    for i in range(len(chord_events)):
+        if i < len(chord_events) - 1:
+            chord_events[i]["_dur"] = chord_events[i + 1]["time"] - chord_events[i]["time"]
+        else:
+            chord_events[i]["_dur"] = 999.0
+
+    # Paso 1: Reemplazar no diatonicos de corta duracion (< 2s)
+    corrected: list[dict] = []
+    for event in chord_events:
+        chord = event["chord"]
+        if chord in diatonic:
+            corrected.append(event)
+            continue
+        if event["_dur"] < 2.0:
+            replacement = _find_nearest_diatonic(chord, diatonic)
+            if replacement:
+                corrected.append({**event, "chord": replacement})
+                continue
+        # Duracion larga o sin reemplazo diatonico: mantener
+        corrected.append(event)
+
+    # Paso 2: Eliminar parpadeos (A → B → A donde B dura < 1s)
+    if len(corrected) >= 3:
+        filtered = [corrected[0]]
+        for i in range(1, len(corrected) - 1):
+            prev = filtered[-1]
+            curr = corrected[i]
+            nxt = corrected[i + 1]
+            if (prev["chord"] == nxt["chord"]
+                    and curr["chord"] != prev["chord"]
+                    and curr.get("_dur", 999) < 1.0):
+                continue
+            filtered.append(curr)
+        filtered.append(corrected[-1])
+        corrected = filtered
+
+    # Paso 3: Fusionar consecutivos iguales
+    merged = [corrected[0]]
+    for event in corrected[1:]:
+        if event["chord"] == merged[-1]["chord"]:
+            continue
+        merged.append(event)
+
+    # Limpiar campo temporal
+    for event in merged:
+        event.pop("_dur", None)
+
+    logger.info("Post-proceso: %d → %d eventos", len(chord_events), len(merged))
+    return merged
 
 
 # ---------------------------------------------------------------------------
