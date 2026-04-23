@@ -1,18 +1,14 @@
 """
 Audio Processor - Servicio de extraccion de letras y acordes.
 Recibe un archivo de audio, transcribe la letra con Whisper (OpenAI)
-y detecta los acordes con Essentia (HPCP + ChordsDetection), con fallback a Librosa.
+y detecta los acordes con Chordino/Librosa, con Essentia como motor legacy opcional.
 """
 
 import os
 import tempfile
 import logging
+import re
 from difflib import SequenceMatcher
-
-
-
-
-
 
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
@@ -23,6 +19,10 @@ from fastapi.middleware.cors import CORSMiddleware
 # ---------------------------------------------------------------------------
 API_SECRET = os.getenv("API_SECRET", "change-me-in-production")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
+CHORD_ENGINE = os.getenv("CHORD_ENGINE", "chordino").strip().lower()
+CHORDINO_ROLL_ON = float(os.getenv("CHORDINO_ROLL_ON", "1"))
+CHORDINO_BOOST_N = float(os.getenv("CHORDINO_BOOST_N", "0.05"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("audio-processor")
@@ -37,16 +37,24 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Verificar disponibilidad de Essentia
+# Verificar disponibilidad de motores de acordes
 # ---------------------------------------------------------------------------
+_CHORDINO_AVAILABLE = False
+try:
+    from chord_extractor.extractors import Chordino as _Chordino
+    _CHORDINO_AVAILABLE = True
+    logger.info("Motor de acordes disponible: Chordino (NNLS Chroma + HMM)")
+except Exception as exc:
+    logger.warning("Chordino no disponible — se usara Librosa si es necesario: %s", exc)
+
 _ESSENTIA_AVAILABLE = False
 try:
     import essentia
     import essentia.standard as _es_std
     _ESSENTIA_AVAILABLE = True
-    logger.info("Motor de acordes: Essentia (HPCP + ChordsDetection)")
-except ImportError:
-    logger.warning("Essentia no disponible — se usara Librosa como fallback")
+    logger.info("Motor de acordes disponible: Essentia (HPCP + ChordsDetection)")
+except Exception as exc:
+    logger.info("Essentia no disponible — motor legacy desactivado: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Plantillas de acordes (mayor, menor, 7)
@@ -55,6 +63,8 @@ except ImportError:
 NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 ENHARMONIC_TO_FLAT = {"C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb"}
+FLAT_TO_ENHARMONIC = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
+CHORD_RE = re.compile(r"^([A-G](?:#|b)?)(.*)$")
 
 
 def _build_template(root_idx: int, intervals: list[tuple[int, float]]) -> np.ndarray:
@@ -64,12 +74,89 @@ def _build_template(root_idx: int, intervals: list[tuple[int, float]]) -> np.nda
     return t
 
 
+def _normalize_note_name(note: str) -> str:
+    """Normaliza notas a sostenidos para el procesamiento interno."""
+    return FLAT_TO_ENHARMONIC.get(note, note)
+
+
+def _to_flat_note(note: str) -> str:
+    return ENHARMONIC_TO_FLAT.get(note, note)
+
+
+def _split_chord_root(chord_name: str) -> tuple[str | None, str, str | None]:
+    """Separa raiz, calidad e inversion opcional en acordes como C#m7/G#."""
+    chord_name = chord_name.strip()
+    main, slash, bass = chord_name.partition("/")
+    match = CHORD_RE.match(main)
+    if not match:
+        return None, chord_name, None
+    root = _normalize_note_name(match.group(1))
+    quality = match.group(2)
+    bass_note = None
+    if slash and bass:
+        bass_match = CHORD_RE.match(bass)
+        bass_note = _normalize_note_name(bass_match.group(1)) if bass_match else bass
+    return root, quality, bass_note
+
+
 def _to_flat(chord_name: str) -> str:
-    """Convierte nombre con sostenido a bemol (A#m -> Bbm)."""
-    for sharp, flat in ENHARMONIC_TO_FLAT.items():
-        if chord_name.startswith(sharp):
-            return flat + chord_name[len(sharp):]
-    return chord_name
+    """Convierte nombre con sostenido a bemol, incluyendo inversiones (C#/G# -> Db/Ab)."""
+    root, quality, bass = _split_chord_root(chord_name)
+    if not root:
+        return chord_name
+    flat_chord = _to_flat_note(root) + quality
+    if bass:
+        flat_chord += "/" + _to_flat_note(bass)
+    return flat_chord
+
+
+def _normalize_chord_label(chord_name: str | None) -> str | None:
+    """Normaliza etiquetas de motores externos al formato usado por SongEditor."""
+    if not chord_name:
+        return None
+
+    cleaned = str(chord_name).strip().replace("♭", "b").replace(" ", "")
+    if not cleaned or cleaned.upper() in {"N", "NOCHORD", "NONE"}:
+        return None
+
+    main, slash, bass = cleaned.partition("/")
+    match = CHORD_RE.match(main)
+    if not match:
+        return None
+
+    root = _normalize_note_name(match.group(1))
+    quality = match.group(2)
+    if quality.startswith(":"):
+        quality = quality[1:]
+
+    quality_map = {
+        "": "",
+        "maj": "",
+        "major": "",
+        "min": "m",
+        "minor": "m",
+        "m": "m",
+        "7": "7",
+        "maj7": "maj7",
+        "major7": "maj7",
+        "min7": "m7",
+        "minor7": "m7",
+        "m7": "m7",
+        "sus2": "sus2",
+        "sus4": "sus4",
+        "dim": "dim",
+        "aug": "aug",
+        "m7b5": "m7b5",
+        "min7b5": "m7b5",
+    }
+    normalized_quality = quality_map.get(quality.lower(), quality)
+
+    normalized = root + normalized_quality
+    if slash and bass:
+        bass_match = CHORD_RE.match(bass)
+        if bass_match:
+            normalized += "/" + _normalize_note_name(bass_match.group(1))
+    return normalized
 
 
 def _use_flats(key: str, key_type: str) -> bool:
@@ -118,6 +205,13 @@ for _i, _note in enumerate(NOTES):
     CHORD_TEMPLATES[f"{_note}m"] = _build_template(_i, [(0, 1.0), (3, 0.8), (7, 0.8)])
     # Septima dominante: 1 - 3M - 5J - 7m (pesos bajos para evitar falsos positivos)
     CHORD_TEMPLATES[f"{_note}7"] = _build_template(_i, [(0, 1.0), (4, 0.5), (7, 0.5), (10, 0.3)])
+    # Septima mayor
+    CHORD_TEMPLATES[f"{_note}maj7"] = _build_template(_i, [(0, 1.0), (4, 0.74), (7, 0.68), (11, 0.36)])
+    # Menor septima
+    CHORD_TEMPLATES[f"{_note}m7"] = _build_template(_i, [(0, 1.0), (3, 0.74), (7, 0.68), (10, 0.36)])
+    # Suspendidos comunes
+    CHORD_TEMPLATES[f"{_note}sus2"] = _build_template(_i, [(0, 1.0), (2, 0.72), (7, 0.7)])
+    CHORD_TEMPLATES[f"{_note}sus4"] = _build_template(_i, [(0, 1.0), (5, 0.76), (7, 0.7)])
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +219,12 @@ for _i, _note in enumerate(NOTES):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "essentia" if _ESSENTIA_AVAILABLE else "librosa"}
+    available = ["librosa"]
+    if _CHORDINO_AVAILABLE:
+        available.insert(0, "chordino")
+    if _ESSENTIA_AVAILABLE:
+        available.append("essentia")
+    return {"status": "ok", "configuredEngine": CHORD_ENGINE, "availableEngines": available}
 
 
 @app.post("/process")
@@ -164,12 +263,14 @@ async def process_audio(
         lyrics_data = transcribe_with_whisper(tmp.name)
         chords_data = detect_chords(tmp.name)
         result = synchronize(lyrics_data, chords_data)
+        result["transcriptionModel"] = lyrics_data.get("model")
 
         logger.info(
-            "Procesamiento completado: %d secciones, clave detectada: %s, %d acordes detectados",
+            "Procesamiento completado: %d secciones, clave detectada: %s, %d acordes detectados, modelo STT: %s",
             len(result["sections"]),
             result["detectedKey"],
             sum(len(line["chords"]) for s in result["sections"] for line in s["lines"]),
+            result.get("transcriptionModel"),
         )
         return result
 
@@ -182,30 +283,55 @@ async def process_audio(
 # Paso 1: Transcripcion con Whisper
 # ---------------------------------------------------------------------------
 WHISPER_PROMPT = (
-    "Cancion cristiana catolica en espanol. "
-    "Letra de alabanza, adoracion y musica liturgica. "
-    "La cancion tiene versos y coros que se repiten varias veces. "
-    "Transcribir todas las repeticiones completas. "
-    "Señor, Dios, Jesús, Cristo, Espíritu Santo, María, aleluya, amén, "
+    "Cancion cristiana catolica cantada en espanol. "
+    "Es una interpretacion vocal musical, no habla conversacional. "
+    "Puede haber melismas, vocales sostenidas y silabas alargadas por el canto. "
+    "Transcribe la palabra real y canonica, sin repetir letras por el sostenido musical. "
+    "No inventes palabras por adornos melodicos ni por respiraciones. "
+    "La cancion tiene versos y coros que se repiten varias veces; conserva las repeticiones reales. "
+    "Vocabulario frecuente: Señor, Dios, Jesús, Cristo, Espíritu Santo, María, aleluya, amén, "
     "cordero, gloria, bendito, misericordia, alabanza, adoración."
 )
 
+TRANSCRIPTION_MODEL_FALLBACKS = [
+    OPENAI_TRANSCRIPTION_MODEL,
+    "gpt-4o-transcribe",
+    "gpt-4o-mini-transcribe",
+    "whisper-1",
+]
+
 
 def transcribe_with_whisper(audio_path: str) -> dict:
-    """Transcribe audio usando Whisper con prompt contextual y timestamps."""
+    """Transcribe audio con el mejor modelo disponible de OpenAI para speech-to-text."""
     import openai
 
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
+    response = None
+    selected_model = None
+    last_error: Exception | None = None
+
     with open(audio_path, "rb") as f:
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
-            language="es",
-            prompt=WHISPER_PROMPT,
-        )
+        for candidate_model in dict.fromkeys(TRANSCRIPTION_MODEL_FALLBACKS):
+            try:
+                f.seek(0)
+                response = client.audio.transcriptions.create(
+                    model=candidate_model,
+                    file=f,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                    language="es",
+                    prompt=WHISPER_PROMPT,
+                )
+                selected_model = candidate_model
+                logger.info("Modelo de transcripcion usado: %s", selected_model)
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Fallo transcripcion con %s: %s", candidate_model, exc)
+
+    if response is None:
+        raise RuntimeError(f"No se pudo transcribir el audio con ningun modelo disponible: {last_error}")
 
     # Extraer texto completo
     full_text = ""
@@ -254,12 +380,51 @@ def transcribe_with_whisper(audio_path: str) -> dict:
             if w_text:
                 words.append({"word": w_text, "start": w_start, "end": w_end})
 
-    logger.info("Whisper: %d segmentos, %d palabras con timestamps", len(segments), len(words))
-    return {"text": full_text, "segments": segments, "words": words}
+    logger.info("Transcripcion (%s): %d segmentos, %d palabras con timestamps", selected_model, len(segments), len(words))
+    return {"text": full_text, "segments": segments, "words": words, "model": selected_model}
 
 
 # ---------------------------------------------------------------------------
-# Paso 2A: Deteccion de acordes con Essentia (primario)
+# Paso 2A: Deteccion de acordes con Chordino (NNLS Chroma + HMM)
+# ---------------------------------------------------------------------------
+def _detect_chords_chordino(audio_path: str) -> list[dict]:
+    """
+    Detecta acordes con Chordino.
+
+    Chordino usa NNLS Chroma para estimar contenido armonico y un HMM interno
+    para estabilizar la secuencia de acordes. Es mas apropiado que el matching
+    directo por plantillas cuando hay voz, guitarras con armonicos fuertes o
+    cambios con ruido melodico.
+    """
+    from chord_extractor.extractors import Chordino
+
+    chordino = Chordino(
+        roll_on=CHORDINO_ROLL_ON,
+        boost_n_likelihood=CHORDINO_BOOST_N,
+        spectral_whitening=1,
+        spectral_shape=0.7,
+    )
+    changes = chordino.extract(audio_path)
+
+    chord_events: list[dict] = []
+    last_chord: str | None = None
+    for change in changes:
+        chord = _normalize_chord_label(getattr(change, "chord", None))
+        timestamp = float(getattr(change, "timestamp", 0.0))
+        if chord is None:
+            last_chord = None
+            continue
+        if chord == last_chord:
+            continue
+        chord_events.append({"chord": chord, "time": round(timestamp, 2)})
+        last_chord = chord
+
+    logger.info("Acordes detectados (Chordino): %d eventos", len(chord_events))
+    return chord_events
+
+
+# ---------------------------------------------------------------------------
+# Paso 2B: Deteccion de acordes con Essentia (legacy opcional)
 # ---------------------------------------------------------------------------
 def _detect_chords_essentia(audio_path: str) -> list[dict]:
     """
@@ -443,41 +608,47 @@ def _detect_key_from_chroma(chroma: np.ndarray) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Paso 2B: Deteccion de acordes con Librosa (fallback)
+# Paso 2C: Deteccion de acordes con Librosa (fallback optimizado)
 # ---------------------------------------------------------------------------
 def _detect_chords_librosa(audio_path: str) -> list[dict]:
     """
-    Detecta acordes usando:
-    1. HPSS (separacion armonica/percusiva) para aislar contenido tonal
-    2. Cromagrama CQT sobre la componente armonica (buena resolucion armonica)
-    3. Analisis sincronizado por beats
-    4. Filtro de mediana suave + filtro de moda
-    5. Deteccion de tonalidad Krumhansl-Kessler + sesgo diatonico fuerte
-    6. Onset snapping para alinear cambios al momento real
+    Detecta acordes usando Librosa como motor local sin dependencias Vamp.
+
+    Cambios frente a la version anterior:
+    1. No colapsa a beat-sync; conserva resolucion temporal de ~46 ms.
+    2. Combina Chroma CQT + CENS para equilibrar detalle y estabilidad.
+    3. Usa Viterbi con transiciones armonicas en vez de argmax frame-a-frame.
+    4. Aplica un sesgo diatonico suave, no una correccion agresiva.
+    5. Ajusta cambios a onsets armonicos cercanos sin moverlos demasiado.
     """
     import librosa
     from scipy.ndimage import median_filter
 
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
+    if len(y) < sr:
+        return []
 
-    # Separar componente armonica (quita percusion)
-    y_harmonic, _ = librosa.effects.hpss(y)
+    hop_length = 1024
 
-    # Detectar beats para sincronizar analisis
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
-    hop_length = 512
+    # Separar componente armonica con margen alto para reducir bateria y ruido.
+    y_harmonic, _ = librosa.effects.hpss(y, margin=(1.0, 5.0))
 
-    # Extraer chroma CQT (mejor resolucion armonica que CENS para guitarra/piano)
-    chroma_cqt = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=hop_length)
+    try:
+        tuning = float(librosa.estimate_tuning(y=y_harmonic, sr=sr))
+    except Exception:
+        tuning = 0.0
 
-    if len(beat_frames) < 2:
-        hop_length = 2048
-        chroma_cqt = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=hop_length)
-        chroma = chroma_cqt
-        times = librosa.frames_to_time(range(chroma.shape[1]), sr=sr, hop_length=hop_length)
-    else:
-        chroma = librosa.util.sync(chroma_cqt, beat_frames, aggregate=np.median)
-        times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
+    chroma_cqt = librosa.feature.chroma_cqt(
+        y=y_harmonic,
+        sr=sr,
+        hop_length=hop_length,
+        n_chroma=12,
+        bins_per_octave=36,
+        tuning=tuning,
+    )
+    chroma_cens = librosa.feature.chroma_cens(y=y_harmonic, sr=sr, hop_length=hop_length)
+    chroma = (0.75 * chroma_cqt) + (0.25 * chroma_cens)
+    times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop_length)
 
     # Detectar onsets armonicos para snap posterior
     onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr, hop_length=hop_length)
@@ -486,9 +657,9 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
 
-    # Filtro de mediana temporal (3 para preservar mas detalle)
-    if chroma.shape[1] > 3:
-        chroma = median_filter(chroma, size=(1, 3))
+    # Filtro temporal leve: estabiliza vibrato/melodia sin borrar cambios cortos.
+    if chroma.shape[1] > 5:
+        chroma = median_filter(chroma, size=(1, 5))
 
     # Normalizar cada frame
     norms = np.linalg.norm(chroma, axis=0, keepdims=True) + 1e-10
@@ -501,85 +672,115 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
         for name in template_names
     ])
 
-    BASIC_CHORDS = {n for n in template_names if not n.endswith("7")}
-    EXTENDED_BONUS = 0.35
     scores = template_matrix @ chroma_norm
-
-    def _classify_frame(frame_idx: int, diatonic_bonus: dict[str, float] | None = None):
-        frame_scores = scores[:, frame_idx].copy()
-        if diatonic_bonus:
-            for j, name in enumerate(template_names):
-                frame_scores[j] += diatonic_bonus.get(name, 0.0)
-        if np.max(frame_scores) < 0.60:
-            return None
-        best_basic_score, best_basic = -1.0, None
-        best_ext_score, best_ext = -1.0, None
-        for j, name in enumerate(template_names):
-            s = frame_scores[j]
-            if name in BASIC_CHORDS:
-                if s > best_basic_score:
-                    best_basic_score, best_basic = s, name
-            else:
-                if s > best_ext_score:
-                    best_ext_score, best_ext = s, name
-        if best_ext and best_ext_score > best_basic_score + EXTENDED_BONUS:
-            return best_ext
-        return best_basic
 
     # --- Detectar tonalidad desde cromagrama (Krumhansl-Kessler) ---
     det_key, det_type = _detect_key_from_chroma(chroma)
     diatonic = _build_diatonic_set(det_key, det_type)
     logger.info("Tonalidad detectada (K-K): %s %s, diatonicos: %s", det_key, det_type, diatonic)
 
-    # --- Clasificacion con sesgo diatonico fuerte ---
-    bonus: dict[str, float] = {}
-    for name in template_names:
+    # --- Emisiones: sesgo diatonico suave + penalizacion para extensiones dudosas ---
+    emission = scores.astype(np.float32).T * 2.2
+    for j, name in enumerate(template_names):
         if name in diatonic:
-            bonus[name] = 0.25
+            emission[:, j] += 0.08
         else:
-            bonus[name] = -0.15
-    raw_chords: list[str | None] = [_classify_frame(i, bonus) for i in range(chroma.shape[1])]
+            emission[:, j] -= 0.02
+        if name.endswith(("maj7", "m7")):
+            emission[:, j] -= 0.16
+        elif name.endswith("7"):
+            emission[:, j] -= 0.18
+        elif name.endswith(("sus2", "sus4")):
+            emission[:, j] -= 0.08
 
-    # Filtro de moda sobre la secuencia (ventana 3 por beat, excluyendo None)
-    if len(raw_chords) > 3:
-        from collections import Counter
-        smoothed = list(raw_chords)
-        half = 1
-        for i in range(len(raw_chords)):
-            window = raw_chords[max(0, i - half):min(len(raw_chords), i + half + 1)]
-            non_null = [c for c in window if c is not None]
-            if non_null:
-                smoothed[i] = Counter(non_null).most_common(1)[0][0]
-        raw_chords = smoothed
+    # --- Transiciones armonicas para Viterbi ---
+    n_states = len(template_names)
+    transition = np.full((n_states, n_states), -0.18, dtype=np.float32)
+    np.fill_diagonal(transition, 0.32)
+
+    state_meta: list[tuple[int, str]] = []
+    for name in template_names:
+        root, quality, _ = _split_chord_root(name)
+        state_meta.append((NOTES.index(root) if root in NOTES else 0, quality))
+
+    for prev_idx, (prev_root, prev_quality) in enumerate(state_meta):
+        for next_idx, (next_root, next_quality) in enumerate(state_meta):
+            if prev_idx == next_idx:
+                continue
+            root_motion = (next_root - prev_root) % 12
+            if root_motion in {5, 7}:  # IV/V, cadencias y circulo de quintas
+                transition[prev_idx, next_idx] += 0.07
+            elif root_motion in {2, 10}:  # movimiento por tono, comun en pop/liturgico
+                transition[prev_idx, next_idx] += 0.03
+            if prev_root == next_root and prev_quality != next_quality:
+                transition[prev_idx, next_idx] -= 0.07
+            if template_names[prev_idx] in diatonic and template_names[next_idx] in diatonic:
+                transition[prev_idx, next_idx] += 0.03
+
+    def _viterbi_decode(emission_scores: np.ndarray) -> list[int]:
+        if emission_scores.shape[0] == 0:
+            return []
+        n_frames, n_labels = emission_scores.shape
+        backptr = np.zeros((n_frames, n_labels), dtype=np.int16)
+        dp = emission_scores[0].copy()
+        for frame_idx in range(1, n_frames):
+            candidates = dp[:, None] + transition
+            backptr[frame_idx] = np.argmax(candidates, axis=0)
+            dp = emission_scores[frame_idx] + np.max(candidates, axis=0)
+        path = np.zeros(n_frames, dtype=np.int16)
+        path[-1] = int(np.argmax(dp))
+        for frame_idx in range(n_frames - 2, -1, -1):
+            path[frame_idx] = backptr[frame_idx + 1, path[frame_idx + 1]]
+        return path.tolist()
+
+    path = _viterbi_decode(emission)
+    best_raw_scores = np.max(scores, axis=0)
+    raw_chords: list[str | None] = []
+    for i, state_idx in enumerate(path):
+        if best_raw_scores[i] < 0.48:
+            raw_chords.append(None)
+        else:
+            raw_chords.append(template_names[state_idx])
 
     # Generar eventos: solo cuando el acorde CAMBIA, duracion minima adaptativa
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr, trim=False)
     _tempo_val = float(np.atleast_1d(tempo)[0]) if hasattr(tempo, '__len__') else float(tempo)
     beat_dur = 60.0 / max(_tempo_val, 60)
-    min_duration = max(0.5, beat_dur * 0.75)
+    min_duration = max(0.4, beat_dur * 0.50)
     logger.info("Tempo (Librosa): %.1f BPM, min_duration: %.2fs", _tempo_val, min_duration)
 
-    chord_events: list[dict] = []
-    current_chord: str | None = None
-    current_start = 0.0
-
+    runs: list[dict] = []
+    current_chord: str | None = raw_chords[0] if raw_chords else None
+    current_start = float(times[0]) if len(times) else 0.0
     for i, chord in enumerate(raw_chords):
         if chord != current_chord:
-            if current_chord is not None and i < len(times):
-                duration = times[i] - current_start
-                if duration >= min_duration:
-                    chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
+            end_time = float(times[i]) if i < len(times) else current_start
+            runs.append({"chord": current_chord, "start": current_start, "end": end_time})
             current_chord = chord
-            current_start = times[i] if i < len(times) else current_start
+            current_start = end_time
 
-    if current_chord is not None:
-        chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
+    if raw_chords:
+        end_time = float(times[-1] + hop_length / sr)
+        runs.append({"chord": current_chord, "start": current_start, "end": end_time})
+
+    chord_events: list[dict] = []
+    for run in runs:
+        chord = run["chord"]
+        if chord is None:
+            continue
+        duration = run["end"] - run["start"]
+        if duration < min_duration:
+            continue
+        if chord_events and chord_events[-1]["chord"] == chord:
+            continue
+        chord_events.append({"chord": chord, "time": round(float(run["start"]), 2)})
 
     # Snap cada cambio de acorde al onset armonico mas cercano (mejora timing)
     if len(onset_times) > 0:
         for event in chord_events:
             closest_idx = np.argmin(np.abs(onset_times - event["time"]))
-            # Solo snap si el onset esta dentro de 0.3s del evento
-            if abs(onset_times[closest_idx] - event["time"]) < 0.3:
+            # Solo snap si el onset esta cerca; evita mover cambios de compas completos.
+            if abs(onset_times[closest_idx] - event["time"]) < 0.22:
                 event["time"] = round(float(onset_times[closest_idx]), 2)
 
     logger.info("Acordes detectados (Librosa): %d eventos", len(chord_events))
@@ -587,22 +788,54 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Paso 2: Wrapper — Essentia primario, Librosa fallback + post-proceso
+# Paso 2: Wrapper — motor configurable + fallback + post-proceso
 # ---------------------------------------------------------------------------
-def detect_chords(audio_path: str) -> list[dict]:
-    """Detecta acordes: intenta Essentia primero, Librosa como fallback.
-    Aplica post-proceso diatonico y eliminacion de ruido al resultado."""
-    events = None
-    if _ESSENTIA_AVAILABLE:
-        try:
-            events = _detect_chords_essentia(audio_path)
-        except Exception as e:
-            logger.error("Error en Essentia chord detection: %s — fallback a Librosa", e, exc_info=True)
-    if events is None:
-        events = _detect_chords_librosa(audio_path)
+def _configured_engine_sequence() -> list[str]:
+    """Resuelve el orden de motores segun CHORD_ENGINE."""
+    if CHORD_ENGINE in {"auto", "default"}:
+        return ["chordino", "librosa"]
+    if CHORD_ENGINE in {"chordino", "nnls"}:
+        return ["chordino", "librosa"]
+    if CHORD_ENGINE == "librosa":
+        return ["librosa"]
+    if CHORD_ENGINE == "essentia":
+        return ["essentia", "librosa"]
 
-    events = _postprocess_chord_events(events)
-    return events
+    logger.warning("CHORD_ENGINE=%s no reconocido; usando chordino con fallback a librosa", CHORD_ENGINE)
+    return ["chordino", "librosa"]
+
+
+def detect_chords(audio_path: str) -> list[dict]:
+    """Detecta acordes con motor configurable y aplica limpieza final."""
+    last_error: Exception | None = None
+    for engine in _configured_engine_sequence():
+        if engine == "chordino" and not _CHORDINO_AVAILABLE:
+            logger.warning("Chordino configurado pero no disponible; probando siguiente motor")
+            continue
+        if engine == "essentia" and not _ESSENTIA_AVAILABLE:
+            logger.warning("Essentia configurado pero no disponible; probando siguiente motor")
+            continue
+
+        try:
+            if engine == "chordino":
+                events = _detect_chords_chordino(audio_path)
+            elif engine == "essentia":
+                events = _detect_chords_essentia(audio_path)
+            else:
+                events = _detect_chords_librosa(audio_path)
+
+            events = _postprocess_chord_events(events)
+            if events:
+                logger.info("Motor de acordes usado: %s", engine)
+                return events
+            logger.warning("Motor %s no produjo acordes; probando siguiente motor", engine)
+        except Exception as e:
+            last_error = e
+            logger.error("Error en motor de acordes %s: %s", engine, e, exc_info=True)
+
+    if last_error:
+        logger.error("Todos los motores de acordes fallaron; ultimo error: %s", last_error)
+    return []
 
 
 def _find_nearest_diatonic(chord: str, diatonic: set[str]) -> str | None:
@@ -650,45 +883,41 @@ def _find_nearest_diatonic(chord: str, diatonic: set[str]) -> str | None:
 
 def _postprocess_chord_events(chord_events: list[dict]) -> list[dict]:
     """Post-procesa eventos de acordes:
-    1. Correccion diatonica: reemplaza no diatonicos breves por el mas cercano
-    2. Eliminacion de parpadeos: quita cambios A→B→A donde B dura < 1s
-    3. Fusion de consecutivos iguales tras correcciones
+    1. Ordena y fusiona duplicados inmediatos
+    2. Elimina parpadeos A→B→A donde B dura muy poco
+    3. Conserva acordes cromaticos reales: no fuerza sustituciones diatonicas
     """
     if len(chord_events) < 2:
         return chord_events
 
-    # Detectar tonalidad desde la frecuencia de acordes
-    all_names = [e["chord"] for e in chord_events]
-    det_key, det_type = _detect_key(all_names)
-    diatonic = _build_diatonic_set(det_key, det_type)
-    logger.info(
-        "Post-proceso: tonalidad %s %s, diatonicos: %s",
-        det_key, det_type, sorted(diatonic),
+    ordered_events = sorted(
+        (
+            {"chord": event["chord"], "time": round(float(event["time"]), 2)}
+            for event in chord_events
+            if event.get("chord") is not None and event.get("time") is not None
+        ),
+        key=lambda event: (event["time"], event["chord"]),
     )
 
-    # Calcular duracion de cada evento
-    for i in range(len(chord_events)):
-        if i < len(chord_events) - 1:
-            chord_events[i]["_dur"] = chord_events[i + 1]["time"] - chord_events[i]["time"]
-        else:
-            chord_events[i]["_dur"] = 999.0
+    if len(ordered_events) < 2:
+        return ordered_events
 
-    # Paso 1: Reemplazar no diatonicos de corta duracion (< 2s)
-    corrected: list[dict] = []
-    for event in chord_events:
-        chord = event["chord"]
-        if chord in diatonic:
-            corrected.append(event)
+    deduped = [ordered_events[0]]
+    for event in ordered_events[1:]:
+        prev = deduped[-1]
+        if event["chord"] == prev["chord"] and abs(event["time"] - prev["time"]) < 0.18:
             continue
-        if event["_dur"] < 2.0:
-            replacement = _find_nearest_diatonic(chord, diatonic)
-            if replacement:
-                corrected.append({**event, "chord": replacement})
-                continue
-        # Duracion larga o sin reemplazo diatonico: mantener
-        corrected.append(event)
+        deduped.append(event)
 
-    # Paso 2: Eliminar parpadeos (A → B → A donde B dura < 1s)
+    # Calcular duracion de cada evento
+    for i in range(len(deduped)):
+        if i < len(deduped) - 1:
+            deduped[i]["_dur"] = deduped[i + 1]["time"] - deduped[i]["time"]
+        else:
+            deduped[i]["_dur"] = 999.0
+
+    # Eliminar parpadeos breves sin reescribir la armonia real
+    corrected = deduped
     if len(corrected) >= 3:
         filtered = [corrected[0]]
         for i in range(1, len(corrected) - 1):
@@ -697,13 +926,13 @@ def _postprocess_chord_events(chord_events: list[dict]) -> list[dict]:
             nxt = corrected[i + 1]
             if (prev["chord"] == nxt["chord"]
                     and curr["chord"] != prev["chord"]
-                    and curr.get("_dur", 999) < 1.0):
+                    and curr.get("_dur", 999) < 0.85):
                 continue
             filtered.append(curr)
         filtered.append(corrected[-1])
         corrected = filtered
 
-    # Paso 3: Fusionar consecutivos iguales
+    # Fusionar consecutivos iguales tras limpiar parpadeos
     merged = [corrected[0]]
     for event in corrected[1:]:
         if event["chord"] == merged[-1]["chord"]:
@@ -878,7 +1107,11 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
             else:
                 break
         if last_before:
-            seg_chords.append({"chord": last_before["chord"], "charIndex": 0})
+            seg_chords.append({
+                "chord": last_before["chord"],
+                "charIndex": 0,
+                "_time": last_before["time"],
+            })
 
         # Acordes que caen DENTRO del rango temporal de esta linea
         for chord_ev in chords_data:
@@ -886,25 +1119,38 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
                 char_index = _time_to_char_index(
                     chord_ev["time"], seg["text"], seg["start"], seg["end"], words,
                 )
-                seg_chords.append({"chord": chord_ev["chord"], "charIndex": char_index})
+                seg_chords.append({
+                    "chord": chord_ev["chord"],
+                    "charIndex": char_index,
+                    "_time": chord_ev["time"],
+                })
 
         # Acordes entre el fin de esta linea y el inicio de la siguiente (intermedios)
         next_start = segments[i + 1]["start"] if i < len(segments) - 1 else seg["end"] + 999
         for chord_ev in chords_data:
             if seg["end"] <= chord_ev["time"] < next_start:
-                seg_chords.append({"chord": chord_ev["chord"], "charIndex": len(seg["text"])})
+                seg_chords.append({
+                    "chord": chord_ev["chord"],
+                    "charIndex": len(seg["text"]),
+                    "_time": chord_ev["time"],
+                })
 
-        # Deduplicar: quitar acordes repetidos consecutivos y misma posicion
-        seen_positions: set[int] = set()
+        # Deduplicar solo duplicados reales, sin descartar acordes distintos
+        seg_chords.sort(key=lambda chord: (chord.get("_time", 0), chord["charIndex"]))
         unique_chords: list[dict] = []
-        prev_chord_name: str | None = None
         for c in seg_chords:
-            if c["chord"] == prev_chord_name:
-                continue
-            if c["charIndex"] not in seen_positions:
-                seen_positions.add(c["charIndex"])
-                unique_chords.append(c)
-                prev_chord_name = c["chord"]
+            normalized_char_index = max(0, int(c["charIndex"]))
+            if unique_chords:
+                prev = unique_chords[-1]
+                same_chord = c["chord"] == prev["chord"]
+                same_spot = abs(normalized_char_index - prev["charIndex"]) <= 1
+                if same_chord and same_spot:
+                    continue
+            unique_chords.append({
+                "chord": c["chord"],
+                "charIndex": normalized_char_index,
+                "_time": c.get("_time", 0),
+            })
 
         # Enforcar espaciado minimo para evitar superposicion visual
         if len(unique_chords) > 1:
@@ -912,27 +1158,14 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
             for c in unique_chords[1:]:
                 prev = spaced[-1]
                 min_pos = prev["charIndex"] + len(prev["chord"]) + 2
-                if c["charIndex"] < min_pos:
-                    if min_pos < len(seg["text"]):
-                        spaced.append({**c, "charIndex": min_pos})
-                    # sin espacio: descartar este acorde
-                else:
-                    spaced.append(c)
+                spaced.append({
+                    **c,
+                    "charIndex": max(c["charIndex"], min_pos),
+                })
             unique_chords = spaced
 
-        # Limitar a maximo 6 acordes por linea
-        if len(unique_chords) > 6:
-            step = len(unique_chords) / 6
-            unique_chords = [unique_chords[int(i * step)] for i in range(6)]
-
-        # Eliminar primer acorde si es igual al ultimo de la linea anterior
-        # (se sobreentiende que sigue sonando desde la linea previa)
-        if unique_chords and current_lines:
-            prev_line_chords = current_lines[-1]["chords"]
-            if (prev_line_chords
-                    and unique_chords[0]["charIndex"] == 0
-                    and unique_chords[0]["chord"] == prev_line_chords[-1]["chord"]):
-                unique_chords = unique_chords[1:]
+        for chord in unique_chords:
+            chord.pop("_time", None)
 
         current_lines.append({
             "lyrics": seg["text"],
@@ -1021,17 +1254,18 @@ def _detect_key(chord_names: list[str]) -> tuple[str, str]:
     freq: dict[str, int] = {}
     for name in chord_names:
         # Extraer solo root + m/dim para el analisis de tonalidad
-        base = name
-        for suffix in ("maj7", "m7", "7", "sus4", "sus2", "dim"):
-            if base.endswith(suffix):
-                base = base[: -len(suffix)]
-                if suffix in ("m7",):
-                    base += "m"
-                elif suffix == "dim":
-                    base += "dim"
-                break
-        if not base:
-            base = name
+        normalized = _normalize_chord_label(name) or name
+        main = normalized.split("/", 1)[0]
+        root, quality, _ = _split_chord_root(main)
+        if not root:
+            continue
+        quality_l = quality.lower()
+        if quality_l in {"m", "m7", "m6", "m9", "min", "min7"}:
+            base = root + "m"
+        elif quality_l in {"dim", "m7b5"}:
+            base = root + "dim"
+        else:
+            base = root
         freq[base] = freq.get(base, 0) + 1
 
     major_intervals = [0, 2, 4, 5, 7, 9, 11]
