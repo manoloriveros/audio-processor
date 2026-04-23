@@ -9,14 +9,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     libyaml-0-2 \
     libchromaprint1 \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-# vamp (dependencia de chord-extractor) necesita numpy disponible durante su instalacion.
-RUN pip install --no-cache-dir "numpy>=1.23.0,<2"
-RUN pip install --no-cache-dir -r requirements.txt
+# vamp (dependencia de chord-extractor) compila una extension nativa y necesita
+# numpy + g++ disponibles durante su instalacion.
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && pip install --no-cache-dir "numpy>=1.23.0,<2" \
+    && pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY main.py .
 
