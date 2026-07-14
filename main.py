@@ -4,6 +4,7 @@ Recibe un archivo de audio, transcribe la letra con Whisper (OpenAI)
 y detecta los acordes con Chordino/Librosa, con Essentia como motor legacy opcional.
 """
 
+import asyncio
 import os
 import secrets as _secrets
 import shutil
@@ -54,6 +55,10 @@ except Exception as _exc:  # pragma: no cover
     logger.warning("Motor Music.ai no disponible: %s", _exc)
 
 app = FastAPI(title="Audio Processor - Song Editor")
+
+# Un trabajo de transcripcion a la vez (la separacion usa 2-3 GB de RAM pico;
+# dos simultaneos podrian provocar OOM). Peticiones adicionales esperan turno.
+_JOB_SEMAPHORE = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 
 app.add_middleware(
     CORSMiddleware,
@@ -452,7 +457,10 @@ async def process_audio(
 
         logger.info("Procesando archivo: %s (%.1f MB)", file.filename, len(content) / 1e6)
 
-        result = run_pipeline(tmp.name)
+        # En hilo aparte: el pipeline es CPU/IO intensivo (minutos) y no debe
+        # bloquear el event loop (health checks y demas peticiones).
+        async with _JOB_SEMAPHORE:
+            result = await asyncio.to_thread(run_pipeline, tmp.name)
         result = _finalize_timestamps(result, attach=False)
 
         logger.info(
@@ -499,13 +507,14 @@ async def process_url(
     workdir = tempfile.mkdtemp(prefix="yt_")
     try:
         logger.info("Descargando audio de YouTube: %s", video_id)
-        audio_path = _download_youtube_audio(video_id, workdir)
+        audio_path = await asyncio.to_thread(_download_youtube_audio, video_id, workdir)
         logger.info(
             "Audio descargado: %s (%.1f MB)",
             os.path.basename(audio_path), os.path.getsize(audio_path) / 1e6,
         )
 
-        result = run_pipeline(audio_path)
+        async with _JOB_SEMAPHORE:
+            result = await asyncio.to_thread(run_pipeline, audio_path)
         result = _finalize_timestamps(result, attach=True)
         result["videoId"] = video_id
         result["youtubeLink"] = f"https://www.youtube.com/watch?v={video_id}"
