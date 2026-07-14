@@ -82,8 +82,10 @@ def separate(audio_path: str):
         "--model_file_dir", _env("MODEL_FILE_DIR", "/models"),
         "--output_dir", workdir,
         "--output_format", "WAV",
-        "--custom_output_names", '{"Vocals": "vocals", "Instrumental": "instrumental"}',
     ]
+    # Nota: sin --custom_output_names por compatibilidad con audio-separator
+    # 0.30.x (la version que resuelve pip con numpy<2); los stems se localizan
+    # por nombre de archivo ("(Vocals)" / "(Instrumental)").
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout_s,
