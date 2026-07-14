@@ -79,7 +79,8 @@ salidas en JSON con esos nombres → copiar el slug a `MUSIC_AI_WORKFLOW`.
 | `MUSIC_AI_WORKFLOW` | `songlory-transcription` | slug del workflow |
 | `MUSIC_AI_JOB_TIMEOUT` | `150` | segundos máx. de espera del job |
 | `YT_MAX_DURATION` | `720` | duración máxima (s) de videos de YouTube |
-| `YTDLP_COOKIES_B64` | — | cookies.txt en base64 para sortear el anti-bot |
+| `YTDLP_PROXY` | — | proxy residencial (http://user:pass@host:puerto) — la vía recomendada contra el anti-bot de YouTube, transparente para todos los usuarios |
+| `YTDLP_COOKIES_B64` | — | cookies.txt en base64 (capa extra opcional; caducan y son por-cuenta) |
 
 ## Notas de despliegue (Railway)
 

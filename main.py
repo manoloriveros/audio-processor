@@ -336,6 +336,12 @@ def _download_youtube_audio(video_id: str, workdir: str) -> str:
         "socket_timeout": 30,
         "retries": 2,
     }
+    # Proxy residencial opcional: evita el bloqueo anti-bot de YouTube sobre
+    # IPs de datacenter de forma transparente para TODOS los usuarios.
+    # Formato: http://usuario:password@host:puerto (o socks5://...)
+    proxy = os.getenv("YTDLP_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
     # Cookies opcionales (base64 de cookies.txt) para sortear el bloqueo
     # anti-bot de YouTube en IPs de datacenter.
     cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
@@ -402,6 +408,8 @@ async def health():
         "configuredEngine": CHORD_ENGINE,
         "availableEngines": available,
         "stemSeparation": bool(separation and separation.is_available()),
+        "youtubeProxy": bool(os.getenv("YTDLP_PROXY")),
+        "youtubeCookies": bool(os.getenv("YTDLP_COOKIES_B64")),
         "llmStructure": bool(OPENAI_API_KEY and os.getenv("LLM_STRUCTURE", "1") != "0"),
         "musicai": bool(musicai_engine and musicai_engine.is_configured()),
     }
