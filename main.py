@@ -5,6 +5,8 @@ y detecta los acordes con Chordino/Librosa, con Essentia como motor legacy opcio
 """
 
 import os
+import secrets as _secrets
+import shutil
 import tempfile
 import logging
 import re
@@ -13,11 +15,14 @@ from difflib import SequenceMatcher
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Configuracion
 # ---------------------------------------------------------------------------
-API_SECRET = os.getenv("API_SECRET", "change-me-in-production")
+# Sin valor por defecto: si API_SECRET no esta configurado, el endpoint rechaza
+# todas las solicitudes (fail closed) en lugar de aceptar un secreto conocido.
+API_SECRET = os.getenv("API_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
 CHORD_ENGINE = os.getenv("CHORD_ENGINE", "chordino").strip().lower()
@@ -26,6 +31,27 @@ CHORDINO_BOOST_N = float(os.getenv("CHORDINO_BOOST_N", "0.05"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("audio-processor")
+
+# ---------------------------------------------------------------------------
+# Modulos opcionales: separacion de stems, estructura LLM y motor Music.ai
+# ---------------------------------------------------------------------------
+try:
+    import separation
+except Exception as _exc:  # pragma: no cover
+    separation = None
+    logger.warning("Modulo de separacion no disponible: %s", _exc)
+
+try:
+    import structuring
+except Exception as _exc:  # pragma: no cover
+    structuring = None
+    logger.warning("Modulo de estructuracion no disponible: %s", _exc)
+
+try:
+    import musicai_engine
+except Exception as _exc:  # pragma: no cover
+    musicai_engine = None
+    logger.warning("Motor Music.ai no disponible: %s", _exc)
 
 app = FastAPI(title="Audio Processor - Song Editor")
 
@@ -215,6 +241,153 @@ for _i, _note in enumerate(NOTES):
 
 
 # ---------------------------------------------------------------------------
+# Nucleo del pipeline (compartido por /process y /process-url)
+# ---------------------------------------------------------------------------
+def run_pipeline(audio_path: str) -> dict:
+    """Ejecuta el pipeline completo sobre un archivo de audio local."""
+    result = None
+
+    # Motor premium opcional: solo se usa si MUSIC_AI_API_KEY esta configurada
+    if musicai_engine is not None and musicai_engine.is_configured():
+        try:
+            result = musicai_engine.process(audio_path)
+        except Exception as exc:
+            logger.error(
+                "Motor Music.ai fallo; se usa el pipeline local: %s", exc, exc_info=True,
+            )
+
+    if result is None:
+        # Paso 0 (opcional): separar voz/instrumental. La voz limpia reduce
+        # alucinaciones de Whisper; el instrumental limpia el cromagrama.
+        vocals_path = instrumental_path = stems_dir = None
+        if separation is not None:
+            vocals_path, instrumental_path, stems_dir = separation.separate(audio_path)
+        try:
+            lyrics_data = transcribe_with_whisper(vocals_path or audio_path)
+            # Beats sobre el mix original (la bateria ayuda al beat-tracking);
+            # armonia sobre el instrumental separado si existe.
+            chords_data = detect_chords(instrumental_path or audio_path, beat_source=audio_path)
+            result = synchronize(lyrics_data, chords_data)
+            result["transcriptionModel"] = lyrics_data.get("model")
+            result["engine"] = "self-hosted+stems" if vocals_path else "self-hosted"
+            if structuring is not None:
+                result["sections"] = structuring.apply_structure(
+                    result["sections"], result["detectedKey"], result["keyType"],
+                )
+        finally:
+            if stems_dir:
+                import shutil as _shutil
+
+                _shutil.rmtree(stems_dir, ignore_errors=True)
+
+    return result
+
+
+def _finalize_timestamps(result: dict, attach: bool) -> dict:
+    """Convierte los _startTime internos en timestamps {time, order} o los elimina.
+
+    Solo el flujo de YouTube adjunta timestamps: los tiempos corresponden al
+    video, asi que los marcadores del editor quedan sincronizados con el player.
+    Para un MP3 subido no hay video de referencia y se omiten (como antes).
+    """
+    order = 1
+    for section in result.get("sections", []):
+        for line in section.get("lines", []):
+            start = line.pop("_startTime", None)
+            if attach and start is not None:
+                line["timestamps"] = [{"time": float(start), "order": order}]
+                order += 1
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Descarga de audio desde YouTube (yt-dlp)
+# ---------------------------------------------------------------------------
+YT_MAX_DURATION = int(os.getenv("YT_MAX_DURATION", "720"))  # 12 min
+_YT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+
+def _extract_youtube_id(url: str) -> str | None:
+    """Extrae el videoId de las formas habituales de URL de YouTube."""
+    if not url:
+        return None
+    candidate = str(url).strip()
+    if _YT_ID_RE.match(candidate):
+        return candidate
+    match = re.search(
+        r"(?:youtube(?:-nocookie)?\.com/(?:watch\?[^#]*v=|embed/|shorts/|live/)|youtu\.be/)"
+        r"([a-zA-Z0-9_-]{11})",
+        candidate,
+    )
+    return match.group(1) if match else None
+
+
+def _download_youtube_audio(video_id: str, workdir: str) -> str:
+    """Descarga el mejor audio del video con yt-dlp y devuelve la ruta local."""
+    import yt_dlp
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": os.path.join(workdir, "audio.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 2,
+    }
+    # Cookies opcionales (base64 de cookies.txt) para sortear el bloqueo
+    # anti-bot de YouTube en IPs de datacenter.
+    cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
+    if cookies_b64:
+        import base64
+
+        cookie_path = os.path.join(workdir, "cookies.txt")
+        with open(cookie_path, "wb") as fh:
+            fh.write(base64.b64decode(cookies_b64))
+        opts["cookiefile"] = cookie_path
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            duration = int(info.get("duration") or 0)
+            if duration > YT_MAX_DURATION:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"El video dura {duration // 60} min; el maximo es "
+                        f"{YT_MAX_DURATION // 60} min"
+                    ),
+                )
+            info = ydl.extract_info(url, download=True)
+            path = ydl.prepare_filename(info)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        message = str(exc)
+        logger.error("yt-dlp fallo para %s: %s", video_id, message[:400])
+        lowered = message.lower()
+        if "sign in" in lowered or "bot" in lowered or "429" in lowered:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "YouTube bloqueo la descarga desde el servidor. "
+                    "Sube el archivo de audio directamente."
+                ),
+            )
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo descargar el audio del video",
+        )
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=502, detail="La descarga no produjo audio")
+    if os.path.getsize(path) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="El audio del video excede 25 MB")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/health")
@@ -224,7 +397,14 @@ async def health():
         available.insert(0, "chordino")
     if _ESSENTIA_AVAILABLE:
         available.append("essentia")
-    return {"status": "ok", "configuredEngine": CHORD_ENGINE, "availableEngines": available}
+    return {
+        "status": "ok",
+        "configuredEngine": CHORD_ENGINE,
+        "availableEngines": available,
+        "stemSeparation": bool(separation and separation.is_available()),
+        "llmStructure": bool(OPENAI_API_KEY and os.getenv("LLM_STRUCTURE", "1") != "0"),
+        "musicai": bool(musicai_engine and musicai_engine.is_configured()),
+    }
 
 
 @app.post("/process")
@@ -232,7 +412,11 @@ async def process_audio(
     file: UploadFile = File(...),
     x_api_secret: str = Header(None),
 ):
-    if x_api_secret != API_SECRET:
+    if not API_SECRET:
+        logger.error("API_SECRET no configurada; rechazando solicitud")
+        raise HTTPException(status_code=503, detail="Servicio no configurado")
+    # Comparacion en tiempo constante para evitar timing attacks
+    if not x_api_secret or not _secrets.compare_digest(x_api_secret, API_SECRET):
         raise HTTPException(status_code=401, detail="No autorizado")
 
     if not OPENAI_API_KEY:
@@ -260,10 +444,8 @@ async def process_audio(
 
         logger.info("Procesando archivo: %s (%.1f MB)", file.filename, len(content) / 1e6)
 
-        lyrics_data = transcribe_with_whisper(tmp.name)
-        chords_data = detect_chords(tmp.name)
-        result = synchronize(lyrics_data, chords_data)
-        result["transcriptionModel"] = lyrics_data.get("model")
+        result = run_pipeline(tmp.name)
+        result = _finalize_timestamps(result, attach=False)
 
         logger.info(
             "Procesamiento completado: %d secciones, clave detectada: %s, %d acordes detectados, modelo STT: %s",
@@ -277,6 +459,59 @@ async def process_audio(
     finally:
         if os.path.exists(tmp.name):
             os.unlink(tmp.name)
+
+
+class ProcessUrlBody(BaseModel):
+    url: str
+
+
+@app.post("/process-url")
+async def process_url(
+    body: ProcessUrlBody,
+    x_api_secret: str = Header(None),
+):
+    """Transcribe una cancion desde un video de YouTube.
+
+    Igual que /process, pero descarga el audio con yt-dlp y ADEMAS adjunta
+    timestamps {time, order} por linea sincronizados con el video, para que
+    los marcadores del editor queden listos.
+    """
+    if not API_SECRET:
+        logger.error("API_SECRET no configurada; rechazando solicitud")
+        raise HTTPException(status_code=503, detail="Servicio no configurado")
+    if not x_api_secret or not _secrets.compare_digest(x_api_secret, API_SECRET):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+
+    video_id = _extract_youtube_id(body.url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="URL de YouTube no valida")
+
+    workdir = tempfile.mkdtemp(prefix="yt_")
+    try:
+        logger.info("Descargando audio de YouTube: %s", video_id)
+        audio_path = _download_youtube_audio(video_id, workdir)
+        logger.info(
+            "Audio descargado: %s (%.1f MB)",
+            os.path.basename(audio_path), os.path.getsize(audio_path) / 1e6,
+        )
+
+        result = run_pipeline(audio_path)
+        result = _finalize_timestamps(result, attach=True)
+        result["videoId"] = video_id
+        result["youtubeLink"] = f"https://www.youtube.com/watch?v={video_id}"
+
+        logger.info(
+            "Procesamiento de YouTube completado: %d secciones, clave %s, %d acordes, motor %s",
+            len(result["sections"]),
+            result["detectedKey"],
+            sum(len(line["chords"]) for s in result["sections"] for line in s["lines"]),
+            result.get("engine"),
+        )
+        return result
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -293,95 +528,224 @@ WHISPER_PROMPT = (
     "cordero, gloria, bendito, misericordia, alabanza, adoración."
 )
 
-TRANSCRIPTION_MODEL_FALLBACKS = [
+TRANSCRIPTION_TIMESTAMP_MODEL = "whisper-1"  # unico modelo de OpenAI con timestamps por palabra
+
+# Modelos de texto de mayor calidad (sin timestamps); corrigen la letra de whisper-1
+TRANSCRIPTION_TEXT_MODELS = [
     OPENAI_TRANSCRIPTION_MODEL,
     "gpt-4o-transcribe",
     "gpt-4o-mini-transcribe",
-    "whisper-1",
 ]
 
 
-def transcribe_with_whisper(audio_path: str) -> dict:
-    """Transcribe audio con el mejor modelo disponible de OpenAI para speech-to-text."""
-    import openai
+def _norm_word(word: str) -> str:
+    """Normaliza una palabra para alineamiento: minusculas, sin tildes ni puntuacion."""
+    import unicodedata
+    decomposed = unicodedata.normalize("NFD", word.lower())
+    stripped = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+    return re.sub(r"[^a-z0-9]", "", stripped)
 
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-    response = None
-    selected_model = None
-    last_error: Exception | None = None
+def _align_corrected_text(corrected_text: str, whisper_words: list[dict]) -> list[dict]:
+    """Proyecta el texto del modelo de mayor calidad sobre los timestamps de whisper-1.
 
-    with open(audio_path, "rb") as f:
-        for candidate_model in dict.fromkeys(TRANSCRIPTION_MODEL_FALLBACKS):
-            try:
-                f.seek(0)
-                response = client.audio.transcriptions.create(
-                    model=candidate_model,
-                    file=f,
-                    response_format="verbose_json",
-                    timestamp_granularities=["word", "segment"],
-                    language="es",
-                    prompt=WHISPER_PROMPT,
-                )
-                selected_model = candidate_model
-                logger.info("Modelo de transcripcion usado: %s", selected_model)
+    gpt-4o-transcribe produce mejor letra pero no entrega timestamps; whisper-1
+    entrega timestamps por palabra pero comete mas errores de texto. Se alinean
+    ambas secuencias de palabras (SequenceMatcher) y cada palabra corregida
+    hereda el tiempo de la palabra de whisper correspondiente.
+    """
+    corrected_tokens = [t for t in corrected_text.split() if t.strip()]
+    if not corrected_tokens or not whisper_words:
+        return whisper_words
+
+    a = [_norm_word(w["word"]) for w in whisper_words]
+    b = [_norm_word(t) for t in corrected_tokens]
+
+    aligned: list[dict] = []
+    matcher = SequenceMatcher(None, a, b, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                w = whisper_words[i1 + k]
+                aligned.append({"word": corrected_tokens[j1 + k], "start": w["start"], "end": w["end"]})
+        elif tag == "replace":
+            span_start = float(whisper_words[i1]["start"])
+            span_end = float(whisper_words[i2 - 1]["end"])
+            dur = max(span_end - span_start, 0.01)
+            n = j2 - j1
+            for k in range(n):
+                aligned.append({
+                    "word": corrected_tokens[j1 + k],
+                    "start": round(span_start + dur * k / n, 3),
+                    "end": round(span_start + dur * (k + 1) / n, 3),
+                })
+        elif tag == "insert":
+            prev_end = float(whisper_words[i1 - 1]["end"]) if i1 > 0 else float(whisper_words[0]["start"])
+            next_start = float(whisper_words[i1]["start"]) if i1 < len(whisper_words) else float(whisper_words[-1]["end"])
+            if next_start <= prev_end:
+                next_start = prev_end + 0.25 * (j2 - j1)
+            n = j2 - j1
+            for k in range(n):
+                aligned.append({
+                    "word": corrected_tokens[j1 + k],
+                    "start": round(prev_end + (next_start - prev_end) * k / n, 3),
+                    "end": round(prev_end + (next_start - prev_end) * (k + 1) / n, 3),
+                })
+        # tag == "delete": palabra que solo esta en whisper (probable alucinacion); se descarta
+
+    return aligned
+
+
+def _rebuild_segments_from_words(words: list[dict], segments: list[dict]) -> list[dict]:
+    """Reconstruye el texto de cada segmento a partir de las palabras corregidas."""
+    if not words or not segments:
+        return segments
+
+    rebuilt = [{"words": [], "start": seg["start"], "end": seg["end"]} for seg in segments]
+
+    for w in words:
+        midpoint = (float(w["start"]) + float(w["end"])) / 2
+        target = None
+        for seg in rebuilt:
+            if seg["start"] - 0.05 <= midpoint <= seg["end"] + 0.05:
+                target = seg
                 break
-            except Exception as exc:
-                last_error = exc
-                logger.warning("Fallo transcripcion con %s: %s", candidate_model, exc)
+        if target is None:
+            target = min(rebuilt, key=lambda s: min(abs(midpoint - s["start"]), abs(midpoint - s["end"])))
+        target["words"].append(w["word"])
 
-    if response is None:
-        raise RuntimeError(f"No se pudo transcribir el audio con ningun modelo disponible: {last_error}")
+    result = []
+    for seg in rebuilt:
+        text = " ".join(seg["words"]).strip()
+        if text:
+            result.append({"text": text, "start": seg["start"], "end": seg["end"]})
+    return result if result else segments
 
-    # Extraer texto completo
-    full_text = ""
-    if hasattr(response, "text"):
-        full_text = response.text
-    elif isinstance(response, dict):
-        full_text = response.get("text", "")
 
-    # Extraer segmentos con timestamps
-    raw_segments = None
-    if hasattr(response, "segments"):
-        raw_segments = response.segments
-    elif isinstance(response, dict) and "segments" in response:
-        raw_segments = response["segments"]
-
-    segments = []
+def _parse_transcription_segments(response) -> list[dict]:
+    segments: list[dict] = []
+    raw_segments = getattr(response, "segments", None)
+    if raw_segments is None and isinstance(response, dict):
+        raw_segments = response.get("segments")
     if raw_segments:
         for seg in raw_segments:
             text = seg["text"] if isinstance(seg, dict) else getattr(seg, "text", "")
             start = seg["start"] if isinstance(seg, dict) else getattr(seg, "start", 0)
             end = seg["end"] if isinstance(seg, dict) else getattr(seg, "end", 0)
-            text = text.strip()
+            text = (text or "").strip()
             if text:
-                segments.append({"text": text, "start": start, "end": end})
+                segments.append({"text": text, "start": float(start), "end": float(end)})
+    return segments
 
-    if not segments and full_text:
-        logger.warning("No se recibieron segmentos con timestamps, usando division por frases")
-        sentences = [s.strip() for s in full_text.replace(".", ".\n").split("\n") if s.strip()]
-        for i, sentence in enumerate(sentences):
-            segments.append({"text": sentence, "start": 0, "end": 0})
 
-    # Extraer palabras con timestamps individuales
+def _parse_transcription_words(response) -> list[dict]:
     words: list[dict] = []
-    raw_words = None
-    if hasattr(response, "words"):
-        raw_words = response.words
-    elif isinstance(response, dict) and "words" in response:
-        raw_words = response["words"]
-
+    raw_words = getattr(response, "words", None)
+    if raw_words is None and isinstance(response, dict):
+        raw_words = response.get("words")
     if raw_words:
         for w in raw_words:
             w_text = w["word"] if isinstance(w, dict) else getattr(w, "word", "")
             w_start = w["start"] if isinstance(w, dict) else getattr(w, "start", 0)
             w_end = w["end"] if isinstance(w, dict) else getattr(w, "end", 0)
-            w_text = w_text.strip()
+            w_text = (w_text or "").strip()
             if w_text:
-                words.append({"word": w_text, "start": w_start, "end": w_end})
+                words.append({"word": w_text, "start": float(w_start), "end": float(w_end)})
+    return words
 
-    logger.info("Transcripcion (%s): %d segmentos, %d palabras con timestamps", selected_model, len(segments), len(words))
-    return {"text": full_text, "segments": segments, "words": words, "model": selected_model}
+
+def transcribe_with_whisper(audio_path: str) -> dict:
+    """Transcripcion en dos pasadas.
+
+    1. whisper-1 (verbose_json): unico modelo con timestamps por palabra/segmento.
+    2. gpt-4o-transcribe (o fallback): texto de mayor calidad, sin timestamps.
+       NOTA: gpt-4o-transcribe NO soporta verbose_json ni timestamp_granularities;
+       pedirselos lanza error 400 (este era el bug que forzaba whisper-1 siempre).
+
+    El texto corregido de la pasada 2 se alinea palabra a palabra con los
+    timestamps de la pasada 1.
+    """
+    import openai
+
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+    # --- Pasada 1: timestamps con whisper-1 ---
+    segments: list[dict] = []
+    words: list[dict] = []
+    whisper_text = ""
+    try:
+        with open(audio_path, "rb") as f:
+            ts_response = client.audio.transcriptions.create(
+                model=TRANSCRIPTION_TIMESTAMP_MODEL,
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
+                language="es",
+                prompt=WHISPER_PROMPT,
+                temperature=0,
+            )
+        whisper_text = getattr(ts_response, "text", "") or (ts_response.get("text", "") if isinstance(ts_response, dict) else "")
+        segments = _parse_transcription_segments(ts_response)
+        words = _parse_transcription_words(ts_response)
+        logger.info(
+            "Pasada 1 (%s): %d segmentos, %d palabras con timestamps",
+            TRANSCRIPTION_TIMESTAMP_MODEL, len(segments), len(words),
+        )
+    except Exception as exc:
+        logger.warning("Fallo whisper-1 (timestamps): %s", exc)
+
+    # --- Pasada 2: texto de alta calidad ---
+    corrected_text = None
+    text_model = None
+    for candidate in dict.fromkeys(TRANSCRIPTION_TEXT_MODELS):
+        if not candidate or candidate == TRANSCRIPTION_TIMESTAMP_MODEL:
+            continue
+        try:
+            with open(audio_path, "rb") as f:
+                response = client.audio.transcriptions.create(
+                    model=candidate,
+                    file=f,
+                    response_format="json",
+                    language="es",
+                    prompt=WHISPER_PROMPT,
+                    temperature=0,
+                )
+            corrected_text = getattr(response, "text", "") or (response.get("text", "") if isinstance(response, dict) else "")
+            if corrected_text.strip():
+                text_model = candidate
+                logger.info("Pasada 2 (%s): %d caracteres", candidate, len(corrected_text))
+                break
+            corrected_text = None
+        except Exception as exc:
+            logger.warning("Fallo transcripcion de texto con %s: %s", candidate, exc)
+
+    if not whisper_text and not corrected_text:
+        raise RuntimeError("No se pudo transcribir el audio con ningun modelo disponible")
+
+    # --- Combinar: texto corregido + timestamps de whisper ---
+    if corrected_text and words:
+        words = _align_corrected_text(corrected_text, words)
+        segments = _rebuild_segments_from_words(words, segments)
+        if not segments and words:
+            segments = [{
+                "text": " ".join(w["word"] for w in words),
+                "start": words[0]["start"],
+                "end": words[-1]["end"],
+            }]
+        full_text = corrected_text
+        model_label = f"{text_model}+{TRANSCRIPTION_TIMESTAMP_MODEL}"
+    elif corrected_text and not segments:
+        # Sin timestamps disponibles: dividir el texto corregido por frases
+        full_text = corrected_text
+        model_label = text_model
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", corrected_text) if s.strip()]
+        segments = [{"text": s, "start": 0.0, "end": 0.0} for s in sentences]
+    else:
+        full_text = whisper_text
+        model_label = TRANSCRIPTION_TIMESTAMP_MODEL
+
+    logger.info("Transcripcion final (%s): %d segmentos, %d palabras", model_label, len(segments), len(words))
+    return {"text": full_text, "segments": segments, "words": words, "model": model_label}
 
 
 # ---------------------------------------------------------------------------
@@ -805,8 +1169,62 @@ def _configured_engine_sequence() -> list[str]:
     return ["chordino", "librosa"]
 
 
-def detect_chords(audio_path: str) -> list[dict]:
-    """Detecta acordes con motor configurable y aplica limpieza final."""
+def _snap_chords_to_beats(audio_path: str, events: list[dict]) -> list[dict]:
+    """Alinea los cambios de acorde a la rejilla de beats y elimina acordes de paso.
+
+    Los motores a veces marcan cambios entre beats o detectan acordes de
+    fraccion de beat (notas de paso) que no pertenecen a la armonia real.
+    """
+    if len(events) < 2:
+        return events
+    try:
+        import librosa
+
+        y, sr = librosa.load(audio_path, sr=22050, mono=True, duration=600)
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        tempo_val = float(np.atleast_1d(tempo)[0])
+        if len(beat_times) < 4 or tempo_val <= 0:
+            return events
+        beat_dur = 60.0 / tempo_val
+
+        snapped = []
+        for ev in events:
+            t = float(ev["time"])
+            idx = int(np.argmin(np.abs(beat_times - t)))
+            if abs(float(beat_times[idx]) - t) <= 0.30 * beat_dur:
+                t = float(beat_times[idx])
+            snapped.append({"chord": ev["chord"], "time": round(t, 2)})
+
+        snapped.sort(key=lambda e: e["time"])
+
+        # Eliminar acordes que duran menos de ~45% de un beat (acordes de paso)
+        min_dur = 0.45 * beat_dur
+        cleaned: list[dict] = []
+        for i, ev in enumerate(snapped):
+            next_time = snapped[i + 1]["time"] if i + 1 < len(snapped) else ev["time"] + 999.0
+            if next_time - ev["time"] < min_dur:
+                continue
+            if cleaned and cleaned[-1]["chord"] == ev["chord"]:
+                continue
+            cleaned.append(ev)
+
+        if cleaned:
+            logger.info("Beat-snap: %d -> %d eventos (%.1f BPM)", len(events), len(cleaned), tempo_val)
+            return cleaned
+        return events
+    except Exception as exc:
+        logger.warning("No se pudo alinear acordes a beats: %s", exc)
+        return events
+
+
+def detect_chords(audio_path: str, beat_source: str | None = None) -> list[dict]:
+    """Detecta acordes con motor configurable y aplica limpieza final.
+
+    beat_source: audio para el beat-tracking del snap final (por defecto el
+    mismo audio_path; conviene pasar el mix original cuando audio_path es el
+    stem instrumental, porque la bateria mejora la deteccion de beats).
+    """
     last_error: Exception | None = None
     for engine in _configured_engine_sequence():
         if engine == "chordino" and not _CHORDINO_AVAILABLE:
@@ -825,6 +1243,7 @@ def detect_chords(audio_path: str) -> list[dict]:
                 events = _detect_chords_librosa(audio_path)
 
             events = _postprocess_chord_events(events)
+            events = _snap_chords_to_beats(beat_source or audio_path, events)
             if events:
                 logger.info("Motor de acordes usado: %s", engine)
                 return events
@@ -1171,6 +1590,7 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
             "lyrics": seg["text"],
             "chords": unique_chords,
             "timestamps": [],
+            "_startTime": round(float(seg["start"]), 3),
         })
 
         # Detectar cambio de seccion por pausa larga (> 2.5 segundos)
@@ -1280,6 +1700,9 @@ def _detect_key(chord_names: list[str]) -> tuple[str, str]:
     for i, note in enumerate(NOTES):
         diatonic = [NOTES[(i + iv) % 12] + major_qualities[j] for j, iv in enumerate(major_intervals)]
         score = sum(freq.get(c, 0) for c in diatonic)
+        # Bonus por presencia de la tonica: desempata tonalidades relativas
+        # (p.ej. G mayor vs E menor comparten todos los acordes diatonicos).
+        score += 0.5 * freq.get(note, 0)
         if score > best_score:
             best_score = score
             best_key = note
@@ -1287,6 +1710,7 @@ def _detect_key(chord_names: list[str]) -> tuple[str, str]:
 
         diatonic = [NOTES[(i + iv) % 12] + minor_qualities[j] for j, iv in enumerate(minor_intervals)]
         score = sum(freq.get(c, 0) for c in diatonic)
+        score += 0.5 * freq.get(note + "m", 0)
         if score > best_score:
             best_score = score
             best_key = note

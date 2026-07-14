@@ -9,21 +9,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     libyaml-0-2 \
     libchromaprint1 \
-    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-# vamp (dependencia de chord-extractor) compila una extension nativa y necesita
-# numpy + g++ disponibles durante su instalacion.
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && pip install --no-cache-dir "numpy>=1.23.0,<2" \
-    && pip install --no-cache-dir -r requirements.txt \
-    && apt-get purge -y --auto-remove build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# vamp (dependencia de chord-extractor) necesita numpy disponible durante su instalacion.
+RUN pip install --no-cache-dir "numpy>=1.23.0,<2"
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py separation.py structuring.py musicai_engine.py ./
+
+# Pre-descargar el modelo de separacion vocal (MDX-Net ONNX) en la imagen
+# para evitar la descarga en el primer request. Kim_Vocal_2: buen equilibrio
+# calidad/velocidad en CPU para voz e instrumental.
+ENV MODEL_FILE_DIR=/models
+RUN audio-separator --download_model_only --model_filename "Kim_Vocal_2.onnx" --model_file_dir /models || \
+    python -c "from audio_separator.separator import Separator; s = Separator(model_file_dir='/models'); s.download_model_files('Kim_Vocal_2.onnx')" || \
+    echo "AVISO: no se pudo pre-descargar el modelo; se descargara en el primer uso"
 
 EXPOSE 8000
 
