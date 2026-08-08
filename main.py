@@ -14,6 +14,7 @@ import re
 from difflib import SequenceMatcher
 
 import numpy as np
+import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -310,6 +311,7 @@ def _finalize_timestamps(result: dict, attach: bool) -> dict:
 # ---------------------------------------------------------------------------
 YT_MAX_DURATION = int(os.getenv("YT_MAX_DURATION", "720"))  # 12 min
 _YT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+_SPOTIFY_TRACK_ID_RE = re.compile(r"^[a-zA-Z0-9]{22}$")
 
 
 def _extract_youtube_id(url: str) -> str | None:
@@ -327,6 +329,43 @@ def _extract_youtube_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _extract_spotify_track_id(url: str) -> str | None:
+    """Extrae un track ID sin seguir redirecciones ni aceptar otros hosts."""
+    if not url:
+        return None
+    candidate = str(url).strip()
+
+    uri_match = re.fullmatch(r"spotify:track:([a-zA-Z0-9]{22})", candidate)
+    if uri_match:
+        return uri_match.group(1)
+
+    url_match = re.match(
+        r"^(?:https?://)?(?:open|play)\.spotify\.com/"
+        r"(?:(?:intl-[a-zA-Z0-9-]+)/)?(?:embed/)?track/"
+        r"([a-zA-Z0-9]{22})(?:[/?#]|$)",
+        candidate,
+    )
+    if not url_match or not _SPOTIFY_TRACK_ID_RE.match(url_match.group(1)):
+        return None
+    return url_match.group(1)
+
+
+def _apply_ytdlp_network_options(opts: dict, workdir: str) -> None:
+    """Aplica proxy/cookies compartidos por descarga y busqueda de YouTube."""
+    proxy = os.getenv("YTDLP_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
+
+    cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
+    if cookies_b64:
+        import base64
+
+        cookie_path = os.path.join(workdir, "cookies.txt")
+        with open(cookie_path, "wb") as fh:
+            fh.write(base64.b64decode(cookies_b64))
+        opts["cookiefile"] = cookie_path
+
+
 def _download_youtube_audio(video_id: str, workdir: str) -> str:
     """Descarga el mejor audio del video con yt-dlp y devuelve la ruta local."""
     import yt_dlp
@@ -341,22 +380,7 @@ def _download_youtube_audio(video_id: str, workdir: str) -> str:
         "socket_timeout": 30,
         "retries": 2,
     }
-    # Proxy residencial opcional: evita el bloqueo anti-bot de YouTube sobre
-    # IPs de datacenter de forma transparente para TODOS los usuarios.
-    # Formato: http://usuario:password@host:puerto (o socks5://...)
-    proxy = os.getenv("YTDLP_PROXY")
-    if proxy:
-        opts["proxy"] = proxy
-    # Cookies opcionales (base64 de cookies.txt) para sortear el bloqueo
-    # anti-bot de YouTube en IPs de datacenter.
-    cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
-    if cookies_b64:
-        import base64
-
-        cookie_path = os.path.join(workdir, "cookies.txt")
-        with open(cookie_path, "wb") as fh:
-            fh.write(base64.b64decode(cookies_b64))
-        opts["cookiefile"] = cookie_path
+    _apply_ytdlp_network_options(opts, workdir)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -396,6 +420,127 @@ def _download_youtube_audio(video_id: str, workdir: str) -> str:
     if os.path.getsize(path) > 25 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="El audio del video excede 25 MB")
     return path
+
+
+def _build_youtube_candidates(search_info: dict, limit: int = 5) -> list[dict]:
+    """Convierte la respuesta plana de yt-dlp en candidatos seguros y acotados."""
+    candidates = []
+    seen_ids = set()
+
+    for entry in (search_info or {}).get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        video_id = str(entry.get("id") or "").strip()
+        if not _YT_ID_RE.match(video_id) or video_id in seen_ids:
+            continue
+
+        try:
+            duration = int(float(entry.get("duration") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        live_status = str(entry.get("live_status") or "").lower()
+        if (
+            duration <= 0
+            or duration > YT_MAX_DURATION
+            or entry.get("is_live")
+            or live_status in {"is_live", "is_upcoming"}
+        ):
+            continue
+
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            continue
+
+        seen_ids.add(video_id)
+        candidates.append({
+            "videoId": video_id,
+            "youtubeLink": f"https://www.youtube.com/watch?v={video_id}",
+            "title": title[:240],
+            "channel": str(entry.get("channel") or entry.get("uploader") or "").strip()[:160],
+            "duration": duration,
+            "thumbnail": str(entry.get("thumbnail") or "").strip(),
+        })
+        if len(candidates) >= limit:
+            break
+
+    return candidates
+
+
+def _resolve_spotify_to_youtube(
+    spotify_url: str,
+    workdir: str,
+    search_query: str | None = None,
+) -> dict:
+    """Usa Spotify solo como identificador y busca fuentes confirmables en YouTube.
+
+    No descarga ni analiza audio de Spotify. El audio solo se procesa mas tarde,
+    tras la confirmacion del usuario, mediante el flujo existente de YouTube.
+    """
+    import yt_dlp
+
+    track_id = _extract_spotify_track_id(spotify_url)
+    if not track_id:
+        raise HTTPException(status_code=400, detail="Pega un enlace de una pista de Spotify")
+
+    canonical_url = f"https://open.spotify.com/track/{track_id}"
+    try:
+        response = requests.get(
+            "https://open.spotify.com/oembed",
+            params={"url": canonical_url},
+            timeout=15,
+        )
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Spotify no encontro esa pista")
+        if response.status_code == 429:
+            raise HTTPException(status_code=503, detail="Spotify esta limitando temporalmente las consultas")
+        if 400 <= response.status_code < 500:
+            raise HTTPException(status_code=400, detail="Spotify rechazo el enlace de la pista")
+        response.raise_for_status()
+        track_title = " ".join(str(response.json().get("title") or "").split())
+    except HTTPException:
+        raise
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("No se pudo resolver Spotify %s: %s", track_id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo identificar la pista de Spotify")
+
+    if not track_title:
+        raise HTTPException(status_code=404, detail="Spotify no devolvio el nombre de la pista")
+
+    opts = {
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 2,
+    }
+    _apply_ytdlp_network_options(opts, workdir)
+    search_hint = " ".join(str(search_query or "").split())[:160]
+    youtube_query = " ".join(filter(None, [track_title[:200], search_hint, "audio"]))
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            search_info = ydl.extract_info(
+                f"ytsearch8:{youtube_query}",
+                download=False,
+            )
+    except Exception as exc:
+        logger.error("YouTube search fallo para Spotify %s: %s", track_id, str(exc)[:400])
+        raise HTTPException(status_code=502, detail="No se pudo buscar una version equivalente en YouTube")
+
+    candidates = _build_youtube_candidates(search_info)
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail="No encontramos una version de YouTube para confirmar",
+        )
+
+    return {
+        "spotifyLink": canonical_url,
+        "trackTitle": track_title,
+        "candidates": candidates,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +624,34 @@ async def process_audio(
 
 class ProcessUrlBody(BaseModel):
     url: str
+
+
+class ResolveSpotifyBody(ProcessUrlBody):
+    searchQuery: str | None = None
+
+
+@app.post("/resolve-spotify")
+async def resolve_spotify(
+    body: ResolveSpotifyBody,
+    x_api_secret: str = Header(None),
+):
+    """Identifica una pista Spotify y propone fuentes de YouTube para confirmar."""
+    if not API_SECRET:
+        logger.error("API_SECRET no configurada; rechazando solicitud")
+        raise HTTPException(status_code=503, detail="Servicio no configurado")
+    if not x_api_secret or not _secrets.compare_digest(x_api_secret, API_SECRET):
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    workdir = tempfile.mkdtemp(prefix="spotify_lookup_")
+    try:
+        return await asyncio.to_thread(
+            _resolve_spotify_to_youtube,
+            body.url,
+            workdir,
+            body.searchQuery,
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 @app.post("/process-url")

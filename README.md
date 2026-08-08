@@ -29,6 +29,12 @@ La separación y los acordes son locales (solo CPU de Railway).
 
 - `POST /process` — multipart con archivo de audio (≤25 MB). Devuelve
   `{sections, detectedKey, keyType, engine, transcriptionModel}`.
+- `POST /resolve-spotify` — JSON `{"url": "https://open.spotify.com/track/..."}`.
+  Usa el enlace únicamente para identificar la pista y devuelve hasta cinco
+  versiones candidatas de YouTube. No descarga ni analiza audio de Spotify:
+  el usuario confirma una versión y después esa URL pasa por `/process-url`.
+  El campo opcional `searchQuery` permite añadir artista o versión cuando el
+  título por sí solo es ambiguo.
 - `POST /process-url` — JSON `{"url": "https://youtube.com/watch?v=..."}`.
   Descarga el audio con **yt-dlp**, ejecuta el mismo pipeline y además:
   - adjunta `timestamps: [{time, order}]` por línea, sincronizados con el

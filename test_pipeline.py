@@ -5,6 +5,8 @@ Ejecutar:  python test_pipeline.py   (o pytest test_pipeline.py -q)
 
 import os
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("LLM_STRUCTURE", "0")  # sin llamadas LLM en tests
 os.environ.pop("OPENAI_API_KEY", None)
@@ -198,6 +200,104 @@ def test_extract_youtube_id():
     for url, expected in cases.items():
         got = main._extract_youtube_id(url)
         assert got == expected, f"{url!r}: esperaba {expected}, obtuve {got}"
+
+
+def test_extract_spotify_track_id():
+    track_id = "4uLU6hMCjMI75M1A2tKUQC"
+    valid = [
+        f"https://open.spotify.com/track/{track_id}?si=abc",
+        f"https://open.spotify.com/intl-es/track/{track_id}",
+        f"https://open.spotify.com/embed/track/{track_id}",
+        f"play.spotify.com/track/{track_id}",
+        f"spotify:track:{track_id}",
+    ]
+    for url in valid:
+        assert main._extract_spotify_track_id(url) == track_id
+
+    invalid = [
+        "https://open.spotify.com/album/6QaVfG1pHYl1z15ZxkvVDW",
+        f"https://open.spotify.com.evil.example/track/{track_id}",
+        "https://spotify.link/abc",
+        "spotify:track:id-invalido",
+        "",
+    ]
+    for url in invalid:
+        assert main._extract_spotify_track_id(url) is None
+
+
+def test_build_youtube_candidates_filters_and_deduplicates():
+    info = {"entries": [
+        {
+            "id": "abc123DEF45",
+            "title": "Version oficial",
+            "channel": "Canal Uno",
+            "duration": 245,
+            "thumbnail": "https://img.example/one.jpg",
+        },
+        {"id": "abc123DEF45", "title": "Duplicado", "duration": 245},
+        {"id": "tooLong0001", "title": "Muy largo", "duration": main.YT_MAX_DURATION + 1},
+        {"id": "liveVideo01", "title": "En vivo", "duration": 200, "is_live": True},
+        {"id": "upcoming001", "title": "Proximo estreno", "duration": 200, "live_status": "is_upcoming"},
+        {"id": "zyx987WVU65", "title": "Version acustica", "uploader": "Canal Dos", "duration": 190},
+    ]}
+
+    candidates = main._build_youtube_candidates(info)
+
+    assert [item["videoId"] for item in candidates] == ["abc123DEF45", "zyx987WVU65"]
+    assert candidates[0]["youtubeLink"] == "https://www.youtube.com/watch?v=abc123DEF45"
+    assert candidates[1]["channel"] == "Canal Dos"
+
+
+def test_resolve_spotify_uses_optional_search_hint():
+    track_id = "4uLU6hMCjMI75M1A2tKUQC"
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"title": "Never Gonna Give You Up"}
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured["options"] = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def extract_info(query, download=False):
+            captured["query"] = query
+            captured["download"] = download
+            return {"entries": [{
+                "id": "abc123DEF45",
+                "title": "Never Gonna Give You Up - Official",
+                "channel": "Rick Astley",
+                "duration": 213,
+            }]}
+
+    fake_ytdlp = SimpleNamespace(YoutubeDL=FakeYoutubeDL)
+    with patch.object(main.requests, "get", return_value=FakeResponse()), \
+            patch.dict(sys.modules, {"yt_dlp": fake_ytdlp}), \
+            patch.dict(os.environ, {"YTDLP_PROXY": "", "YTDLP_COOKIES_B64": ""}):
+        result = main._resolve_spotify_to_youtube(
+            f"https://open.spotify.com/track/{track_id}",
+            ".",
+            "Rick Astley official",
+        )
+
+    assert captured["query"] == "ytsearch8:Never Gonna Give You Up Rick Astley official audio"
+    assert captured["download"] is False
+    assert result["spotifyLink"] == f"https://open.spotify.com/track/{track_id}"
+    assert result["candidates"][0]["videoId"] == "abc123DEF45"
 
 
 def test_finalize_timestamps_attach_and_strip():
