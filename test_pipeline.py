@@ -22,7 +22,7 @@ def test_normalize_chord_labels():
         "C:maj": "C", "D:min": "Dm", "D:min7": "Dm7", "G:7": "G7",
         "Bb:maj": "A#", "F#:min": "F#m", "N": None, "noChord": None,
         "C/E": "C/E", "Cmaj7": "Cmaj7", "A:sus4": "Asus4",
-        "E:min/5": "Em",  # bajo por grado se descarta con seguridad
+        "E:min/5": "Em/B",  # conservar la inversion indicada por el motor
     }
     for raw, expected in cases.items():
         got = main._normalize_chord_label(raw)
@@ -32,13 +32,13 @@ def test_normalize_chord_labels():
 def test_parse_chords_shapes():
     payload_a = [
         {"start": 0.5, "end": 2.0, "chord_majmin": "D:min"},
-        {"start": 2.0, "end": 4.0, "chord_majmin": "D:min"},   # duplicado consecutivo
+        {"start": 2.0, "end": 4.0, "chord_majmin": "D:min"},   # intervalo consecutivo conservado
         {"start": 4.0, "end": 6.0, "chord_majmin": "Bb:maj"},
-        {"start": 6.0, "end": 7.0, "chord_majmin": "N"},        # se descarta
+        {"start": 6.0, "end": 7.0, "chord_majmin": "N"},        # silencio armonico conservado
         {"start": 7.0, "end": 9.0, "chord_majmin": "A:7"},
     ]
     events = me._parse_chords(payload_a)
-    assert [e["chord"] for e in events] == ["Dm", "A#", "A7"], events
+    assert [e["chord"] for e in events] == ["Dm", "Dm", "A#", "N", "A7"], events
     payload_b = {"data": [{"time": 1.0, "chord": "Em"}, {"time": 3.0, "name": "C"}]}
     events_b = me._parse_chords(payload_b)
     assert [e["chord"] for e in events_b] == ["Em", "C"]
@@ -78,12 +78,12 @@ def test_group_segments_and_sections():
     ]
     sections = [
         {"label": "verse", "start": 0.0, "end": 10.0},
-        {"label": "instrumental", "start": 10.0, "end": 19.0},  # sin lineas → fuera
+        {"label": "instrumental", "start": 10.0, "end": 19.0},  # conservar tambien sin letra
         {"label": "chorus", "start": 19.0, "end": 30.0},
     ]
     groups = me._group_segments(segments, sections)
-    assert len(groups) == 2
-    assert [len(g["segments"]) for g in groups] == [2, 2]
+    assert len(groups) == 3
+    assert [len(g["segments"]) for g in groups] == [2, 0, 2]
 
     chords = [
         {"chord": "Dm", "time": 0.5},
@@ -92,14 +92,14 @@ def test_group_segments_and_sections():
         {"chord": "Dm", "time": 25.0},
     ]
     built = me._build_sections(groups, chords, words=[])
-    assert [s["name"] for s in built] == ["Verso 1", "Coro"], built
+    assert [s["name"] for s in built] == ["Verso 1", "Instrumental", "Coro"], built
     first_line = built[0]["lines"][0]
     assert first_line["chords"][0] == {"chord": "Dm", "charIndex": 0}
-    # linea 2: activo Dm suprimido (igual que el ultimo de la linea 1), A# dentro
+    # Conservar acorde activo y cambio dentro de la segunda linea
     second_line = built[0]["lines"][1]
-    assert [c["chord"] for c in second_line["chords"]] == ["A#"], second_line
+    assert [c["chord"] for c in second_line["chords"]] == ["Dm", "A#"], second_line
     # coro: C activo al inicio de la seccion aunque venga de antes
-    coro_line = built[1]["lines"][0]
+    coro_line = next(line for line in built[2]["lines"] if line["lyrics"])
     assert coro_line["chords"][0]["chord"] == "C"
 
 
@@ -111,20 +111,22 @@ def test_snap_to_beats():
         {"chord": "Am", "time": 8.51},  # → 8.5
     ]
     snapped = me._snap_to_beats(events, beats)
-    assert snapped[0]["time"] == 1.0
+    assert snapped[0]["time"] == 1.06
+    assert snapped[0]["beatTime"] == 1.0
     assert snapped[1]["time"] == 4.74
-    assert snapped[2]["time"] == 8.5
+    assert snapped[2]["time"] == 8.51
+    assert snapped[2]["beatTime"] == 8.5
 
 
-def test_remap_chords_proportional():
+def test_remap_chords_follows_lyric_characters():
     chords = [{"chord": "C", "charIndex": 0}, {"chord": "G", "charIndex": 10}]
     remapped = structuring.remap_chords(chords, "senor ten piedad", "Señor, ten piedad")
     assert remapped[0]["charIndex"] == 0
-    assert 9 <= remapped[1]["charIndex"] <= 12, remapped
-    # respace evita superposicion
+    assert remapped[1]["charIndex"] == 11, remapped
+    # El espaciado visual no altera las anclas musicales
     tight = [{"chord": "Cmaj7", "charIndex": 5}, {"chord": "G", "charIndex": 6}]
     spaced = structuring.respace(tight)
-    assert spaced[1]["charIndex"] >= 5 + len("Cmaj7") + 2
+    assert spaced == tight
 
 
 def test_legacy_synchronize_end_to_end():

@@ -188,6 +188,13 @@ def _normalize_chord_label(chord_name: str | None) -> str | None:
         bass_match = CHORD_RE.match(bass)
         if bass_match:
             normalized += "/" + _normalize_note_name(bass_match.group(1))
+        else:
+            degree = re.fullmatch(r"([b#]*)([1-7])", bass)
+            if degree and root in NOTES:
+                intervals = (0, 2, 4, 5, 7, 9, 11)
+                alteration = degree.group(1).count("#") - degree.group(1).count("b")
+                offset = intervals[int(degree.group(2)) - 1] + alteration
+                normalized += "/" + NOTES[(NOTES.index(root) + offset) % 12]
     return normalized
 
 
@@ -275,6 +282,9 @@ def run_pipeline(audio_path: str) -> dict:
             chords_data = detect_chords(instrumental_path or audio_path, beat_source=audio_path)
             result = synchronize(lyrics_data, chords_data)
             result["transcriptionModel"] = lyrics_data.get("model")
+            result["analysisWarnings"] = lyrics_data.get("warnings", [])
+            result["analysisDuration"] = lyrics_data.get("duration")
+            result["transcriptionChunks"] = lyrics_data.get("chunkCount", 1)
             result["engine"] = "self-hosted+stems" if vocals_path else "self-hosted"
             if structuring is not None:
                 result["sections"] = structuring.apply_structure(
@@ -300,7 +310,11 @@ def _finalize_timestamps(result: dict, attach: bool) -> dict:
     for section in result.get("sections", []):
         for line in section.get("lines", []):
             start = line.pop("_startTime", None)
-            if attach and start is not None:
+            line.pop("_endTime", None)
+            line.pop("_words", None)
+            estimated = line.pop("timing_estimated", False)
+            line.pop("timestamp_source", None)
+            if attach and start is not None and not estimated:
                 line["timestamps"] = [{"time": float(start), "order": order}]
                 order += 1
     return result
@@ -560,7 +574,7 @@ async def health():
         "stemSeparation": bool(separation and separation.is_available()),
         "youtubeProxy": bool(os.getenv("YTDLP_PROXY")),
         "youtubeCookies": bool(os.getenv("YTDLP_COOKIES_B64")),
-        "llmStructure": bool(OPENAI_API_KEY and os.getenv("LLM_STRUCTURE", "1") != "0"),
+        "llmStructure": bool(OPENAI_API_KEY and os.getenv("LLM_STRUCTURE", "0") != "0"),
         "musicai": bool(musicai_engine and musicai_engine.is_configured()),
     }
 
@@ -737,53 +751,9 @@ def _norm_word(word: str) -> str:
 
 
 def _align_corrected_text(corrected_text: str, whisper_words: list[dict]) -> list[dict]:
-    """Proyecta el texto del modelo de mayor calidad sobre los timestamps de whisper-1.
-
-    gpt-4o-transcribe produce mejor letra pero no entrega timestamps; whisper-1
-    entrega timestamps por palabra pero comete mas errores de texto. Se alinean
-    ambas secuencias de palabras (SequenceMatcher) y cada palabra corregida
-    hereda el tiempo de la palabra de whisper correspondiente.
-    """
-    corrected_tokens = [t for t in corrected_text.split() if t.strip()]
-    if not corrected_tokens or not whisper_words:
-        return whisper_words
-
-    a = [_norm_word(w["word"]) for w in whisper_words]
-    b = [_norm_word(t) for t in corrected_tokens]
-
-    aligned: list[dict] = []
-    matcher = SequenceMatcher(None, a, b, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            for k in range(i2 - i1):
-                w = whisper_words[i1 + k]
-                aligned.append({"word": corrected_tokens[j1 + k], "start": w["start"], "end": w["end"]})
-        elif tag == "replace":
-            span_start = float(whisper_words[i1]["start"])
-            span_end = float(whisper_words[i2 - 1]["end"])
-            dur = max(span_end - span_start, 0.01)
-            n = j2 - j1
-            for k in range(n):
-                aligned.append({
-                    "word": corrected_tokens[j1 + k],
-                    "start": round(span_start + dur * k / n, 3),
-                    "end": round(span_start + dur * (k + 1) / n, 3),
-                })
-        elif tag == "insert":
-            prev_end = float(whisper_words[i1 - 1]["end"]) if i1 > 0 else float(whisper_words[0]["start"])
-            next_start = float(whisper_words[i1]["start"]) if i1 < len(whisper_words) else float(whisper_words[-1]["end"])
-            if next_start <= prev_end:
-                next_start = prev_end + 0.25 * (j2 - j1)
-            n = j2 - j1
-            for k in range(n):
-                aligned.append({
-                    "word": corrected_tokens[j1 + k],
-                    "start": round(prev_end + (next_start - prev_end) * k / n, 3),
-                    "end": round(prev_end + (next_start - prev_end) * (k + 1) / n, 3),
-                })
-        # tag == "delete": palabra que solo esta en whisper (probable alucinacion); se descarta
-
-    return aligned
+    """Keep measured times; reject corrections that erase or insert words."""
+    from transcription_alignment import align_corrected_words
+    return align_corrected_words(corrected_text, whisper_words)[0]
 
 
 def _rebuild_segments_from_words(words: list[dict], segments: list[dict]) -> list[dict]:
@@ -845,97 +815,16 @@ def _parse_transcription_words(response) -> list[dict]:
 
 
 def transcribe_with_whisper(audio_path: str) -> dict:
-    """Transcripcion en dos pasadas.
-
-    1. whisper-1 (verbose_json): unico modelo con timestamps por palabra/segmento.
-    2. gpt-4o-transcribe (o fallback): texto de mayor calidad, sin timestamps.
-       NOTA: gpt-4o-transcribe NO soporta verbose_json ni timestamp_granularities;
-       pedirselos lanza error 400 (este era el bug que forzaba whisper-1 siempre).
-
-    El texto corregido de la pasada 2 se alinea palabra a palabra con los
-    timestamps de la pasada 1.
-    """
-    import openai
-
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-    # --- Pasada 1: timestamps con whisper-1 ---
-    segments: list[dict] = []
-    words: list[dict] = []
-    whisper_text = ""
-    try:
-        with open(audio_path, "rb") as f:
-            ts_response = client.audio.transcriptions.create(
-                model=TRANSCRIPTION_TIMESTAMP_MODEL,
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-                language="es",
-                prompt=WHISPER_PROMPT,
-                temperature=0,
-            )
-        whisper_text = getattr(ts_response, "text", "") or (ts_response.get("text", "") if isinstance(ts_response, dict) else "")
-        segments = _parse_transcription_segments(ts_response)
-        words = _parse_transcription_words(ts_response)
-        logger.info(
-            "Pasada 1 (%s): %d segmentos, %d palabras con timestamps",
-            TRANSCRIPTION_TIMESTAMP_MODEL, len(segments), len(words),
-        )
-    except Exception as exc:
-        logger.warning("Fallo whisper-1 (timestamps): %s", exc)
-
-    # --- Pasada 2: texto de alta calidad ---
-    corrected_text = None
-    text_model = None
-    for candidate in dict.fromkeys(TRANSCRIPTION_TEXT_MODELS):
-        if not candidate or candidate == TRANSCRIPTION_TIMESTAMP_MODEL:
-            continue
-        try:
-            with open(audio_path, "rb") as f:
-                response = client.audio.transcriptions.create(
-                    model=candidate,
-                    file=f,
-                    response_format="json",
-                    language="es",
-                    prompt=WHISPER_PROMPT,
-                    temperature=0,
-                )
-            corrected_text = getattr(response, "text", "") or (response.get("text", "") if isinstance(response, dict) else "")
-            if corrected_text.strip():
-                text_model = candidate
-                logger.info("Pasada 2 (%s): %d caracteres", candidate, len(corrected_text))
-                break
-            corrected_text = None
-        except Exception as exc:
-            logger.warning("Fallo transcripcion de texto con %s: %s", candidate, exc)
-
-    if not whisper_text and not corrected_text:
-        raise RuntimeError("No se pudo transcribir el audio con ningun modelo disponible")
-
-    # --- Combinar: texto corregido + timestamps de whisper ---
-    if corrected_text and words:
-        words = _align_corrected_text(corrected_text, words)
-        segments = _rebuild_segments_from_words(words, segments)
-        if not segments and words:
-            segments = [{
-                "text": " ".join(w["word"] for w in words),
-                "start": words[0]["start"],
-                "end": words[-1]["end"],
-            }]
-        full_text = corrected_text
-        model_label = f"{text_model}+{TRANSCRIPTION_TIMESTAMP_MODEL}"
-    elif corrected_text and not segments:
-        # Sin timestamps disponibles: dividir el texto corregido por frases
-        full_text = corrected_text
-        model_label = text_model
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", corrected_text) if s.strip()]
-        segments = [{"text": s, "start": 0.0, "end": 0.0} for s in sentences]
-    else:
-        full_text = whisper_text
-        model_label = TRANSCRIPTION_TIMESTAMP_MODEL
-
-    logger.info("Transcripcion final (%s): %d segmentos, %d palabras", model_label, len(segments), len(words))
-    return {"text": full_text, "segments": segments, "words": words, "model": model_label}
+    """Transcribe bounded mono chunks, retaining their original audio times."""
+    from transcription_service import transcribe_audio
+    result = transcribe_audio(
+        audio_path, api_key=OPENAI_API_KEY,
+        timestamp_model=TRANSCRIPTION_TIMESTAMP_MODEL,
+        text_models=TRANSCRIPTION_TEXT_MODELS, prompt=WHISPER_PROMPT,
+    )
+    logger.info("Transcripcion: %d fragmentos, %d palabras, %.1fs",
+                result["chunkCount"], len(result["words"]), result["duration"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -965,12 +854,10 @@ def _detect_chords_chordino(audio_path: str) -> list[dict]:
     for change in changes:
         chord = _normalize_chord_label(getattr(change, "chord", None))
         timestamp = float(getattr(change, "timestamp", 0.0))
-        if chord is None:
-            last_chord = None
-            continue
+        chord = chord or "N"
         if chord == last_chord:
             continue
-        chord_events.append({"chord": chord, "time": round(timestamp, 2)})
+        chord_events.append({"chord": chord, "time": round(timestamp, 6)})
         last_chord = chord
 
     logger.info("Acordes detectados (Chordino): %d eventos", len(chord_events))
@@ -986,7 +873,7 @@ def _detect_chords_essentia(audio_path: str) -> list[dict]:
     1. HPCP (36-bin Harmonic Pitch Class Profile) — mejor resolucion que chroma
     2. ChordsDetection con plantillas Gaussianas (mayor, menor, dim, aug)
     3. Post-proceso para detectar septimas desde HPCP
-    4. min_duration adaptativo segun tempo
+    4. Conserva los cambios e intervalos producidos por el detector
     """
     import essentia
     import essentia.standard as es
@@ -1090,45 +977,16 @@ def _detect_chords_essentia(audio_path: str) -> list[dict]:
         else:
             enhanced_chords.append(chord)
 
-    # --- Suavizado: filtro de moda (ventana ~400ms a 46ms/frame) ---
-    if len(enhanced_chords) > 9:
-        from collections import Counter
-        smoothed_e = list(enhanced_chords)
-        half_e = 4  # ventana de 9 frames ≈ 414ms
-        for idx_e in range(len(enhanced_chords)):
-            win = enhanced_chords[max(0, idx_e - half_e):min(len(enhanced_chords), idx_e + half_e + 1)]
-            non_null = [c for c in win if c != "N"]
-            if non_null and enhanced_chords[idx_e] != "N":
-                smoothed_e[idx_e] = Counter(non_null).most_common(1)[0][0]
-        enhanced_chords = smoothed_e
-
-    # --- Generar eventos con min_duration adaptativo ---
-    chord_events: list[dict] = []
-    current_chord: str | None = None
-    current_start = 0.0
-    min_duration = max(0.5, beat_dur * 0.75)  # ~75% de un beat, minimo 0.5s
-
-    for i, chord in enumerate(enhanced_chords):
-        t = times[i] if i < len(times) else times[-1]
-
-        if chord == "N":
-            if current_chord is not None:
-                dur = t - current_start
-                if dur >= min_duration:
-                    chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
-                current_chord = None
+    # Keep each decoder state interval, including N and short real changes.
+    from timeline import normalize_events
+    chord_events = []
+    for index, label in enumerate(enhanced_chords):
+        chord = _normalize_chord_label(label) or "N"
+        if chord_events and chord_events[-1]["chord"] == chord:
             continue
-
-        if chord != current_chord:
-            if current_chord is not None:
-                dur = t - current_start
-                if dur >= min_duration:
-                    chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
-            current_chord = chord
-            current_start = t
-
-    if current_chord is not None:
-        chord_events.append({"chord": current_chord, "time": round(current_start, 2)})
+        chord_events.append({"chord": chord, "time": float(times[index]),
+                             "strength": float(strengths[index])})
+    chord_events = normalize_events(chord_events, duration=len(audio) / sr)
 
     logger.info("Acordes (Essentia): %d eventos", len(chord_events))
     return chord_events
@@ -1173,7 +1031,7 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     2. Combina Chroma CQT + CENS para equilibrar detalle y estabilidad.
     3. Usa Viterbi con transiciones armonicas en vez de argmax frame-a-frame.
     4. Aplica un sesgo diatonico suave, no una correccion agresiva.
-    5. Ajusta cambios a onsets armonicos cercanos sin moverlos demasiado.
+    5. Adjunta onsets armonicos cercanos sin mover los tiempos detectados.
     """
     import librosa
     from scipy.ndimage import median_filter
@@ -1204,7 +1062,7 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
     chroma = (0.75 * chroma_cqt) + (0.25 * chroma_cens)
     times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop_length)
 
-    # Detectar onsets armonicos para snap posterior
+    # Detectar onsets armonicos como referencia temporal
     onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr, hop_length=hop_length)
     onset_frames = librosa.onset.onset_detect(
         y=y_harmonic, sr=sr, hop_length=hop_length, onset_envelope=onset_env,
@@ -1289,20 +1147,24 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
 
     path = _viterbi_decode(emission)
     best_raw_scores = np.max(scores, axis=0)
+    # CQT/CENS normalization can amplify numerical tails into a confident
+    # chord during digital silence. Check absolute energy in the ORIGINAL
+    # signal, with the same centered frame grid, before accepting a label.
+    # -140 dBFS is deliberately conservative: quiet music is not a rest.
+    raw_rms = librosa.feature.rms(
+        y=y, frame_length=2048, hop_length=hop_length, center=True,
+    )[0]
+    digital_silence = np.zeros(len(path), dtype=bool)
+    shared_frames = min(len(raw_rms), len(path))
+    digital_silence[:shared_frames] = raw_rms[:shared_frames] <= 1e-7
     raw_chords: list[str | None] = []
     for i, state_idx in enumerate(path):
-        if best_raw_scores[i] < 0.48:
+        if digital_silence[i] or best_raw_scores[i] < 0.48:
             raw_chords.append(None)
         else:
             raw_chords.append(template_names[state_idx])
 
-    # Generar eventos: solo cuando el acorde CAMBIA, duracion minima adaptativa
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr, trim=False)
-    _tempo_val = float(np.atleast_1d(tempo)[0]) if hasattr(tempo, '__len__') else float(tempo)
-    beat_dur = 60.0 / max(_tempo_val, 60)
-    min_duration = max(0.4, beat_dur * 0.50)
-    logger.info("Tempo (Librosa): %.1f BPM, min_duration: %.2fs", _tempo_val, min_duration)
-
+    # Preserve all state changes; timing annotations never overwrite evidence.
     runs: list[dict] = []
     current_chord: str | None = raw_chords[0] if raw_chords else None
     current_start = float(times[0]) if len(times) else 0.0
@@ -1317,25 +1179,16 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
         end_time = float(times[-1] + hop_length / sr)
         runs.append({"chord": current_chord, "start": current_start, "end": end_time})
 
-    chord_events: list[dict] = []
-    for run in runs:
-        chord = run["chord"]
-        if chord is None:
-            continue
-        duration = run["end"] - run["start"]
-        if duration < min_duration:
-            continue
-        if chord_events and chord_events[-1]["chord"] == chord:
-            continue
-        chord_events.append({"chord": chord, "time": round(float(run["start"]), 2)})
-
-    # Snap cada cambio de acorde al onset armonico mas cercano (mejora timing)
+    chord_events = [
+        {"chord": run["chord"] or "N", "time": float(run["start"]),
+         "end": min(float(run["end"]), len(y) / sr)}
+        for run in runs
+    ]
     if len(onset_times) > 0:
         for event in chord_events:
             closest_idx = np.argmin(np.abs(onset_times - event["time"]))
-            # Solo snap si el onset esta cerca; evita mover cambios de compas completos.
             if abs(onset_times[closest_idx] - event["time"]) < 0.22:
-                event["time"] = round(float(onset_times[closest_idx]), 2)
+                event["onsetTime"] = float(onset_times[closest_idx])
 
     logger.info("Acordes detectados (Librosa): %d eventos", len(chord_events))
     return chord_events
@@ -1360,51 +1213,48 @@ def _configured_engine_sequence() -> list[str]:
 
 
 def _snap_chords_to_beats(audio_path: str, events: list[dict]) -> list[dict]:
-    """Alinea los cambios de acorde a la rejilla de beats y elimina acordes de paso.
+    """Attach nearby beat evidence without moving or deleting measured events.
 
-    Los motores a veces marcan cambios entre beats o detectan acordes de
-    fraccion de beat (notas de paso) que no pertenecen a la armonia real.
+    Decode one short window at a time; every part of long recordings is covered.
+    The shared chunk helper owns overlap boundaries so beats are not duplicated.
     """
-    if len(events) < 2:
+    if not events:
         return events
     try:
         import librosa
-
-        y, sr = librosa.load(audio_path, sr=22050, mono=True, duration=600)
-        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-        tempo_val = float(np.atleast_1d(tempo)[0])
-        if len(beat_times) < 4 or tempo_val <= 0:
+        from bisect import bisect_left
+        from transcription_chunks import iter_audio_chunks
+        beats = []
+        with iter_audio_chunks(audio_path, chunk_seconds=60.0, overlap_seconds=4.0) as chunks:
+            for chunk in chunks:
+                y, sr = librosa.load(chunk.path, sr=None, mono=True)
+                tempo, frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
+                tempo_value = float(np.atleast_1d(tempo)[0])
+                if tempo_value <= 0:
+                    continue
+                tolerance = min(0.12, 0.2 * 60.0 / tempo_value)
+                for local_time in librosa.frames_to_time(frames, sr=sr):
+                    absolute_time = float(chunk.start + local_time)
+                    if chunk.owns(absolute_time):
+                        beats.append((absolute_time, tolerance))
+        beats.sort()
+        if not beats:
             return events
-        beat_dur = 60.0 / tempo_val
-
-        snapped = []
-        for ev in events:
-            t = float(ev["time"])
-            idx = int(np.argmin(np.abs(beat_times - t)))
-            if abs(float(beat_times[idx]) - t) <= 0.30 * beat_dur:
-                t = float(beat_times[idx])
-            snapped.append({"chord": ev["chord"], "time": round(t, 2)})
-
-        snapped.sort(key=lambda e: e["time"])
-
-        # Eliminar acordes que duran menos de ~45% de un beat (acordes de paso)
-        min_dur = 0.45 * beat_dur
-        cleaned: list[dict] = []
-        for i, ev in enumerate(snapped):
-            next_time = snapped[i + 1]["time"] if i + 1 < len(snapped) else ev["time"] + 999.0
-            if next_time - ev["time"] < min_dur:
-                continue
-            if cleaned and cleaned[-1]["chord"] == ev["chord"]:
-                continue
-            cleaned.append(ev)
-
-        if cleaned:
-            logger.info("Beat-snap: %d -> %d eventos (%.1f BPM)", len(events), len(cleaned), tempo_val)
-            return cleaned
-        return events
+        beat_times = [beat[0] for beat in beats]
+        annotated = []
+        for event in events:
+            item = dict(event)
+            if event.get("chord") not in {None, "N"}:
+                index = bisect_left(beat_times, event["time"])
+                candidates = beats[max(0, index - 1):index + 1]
+                if candidates:
+                    beat, tolerance = min(candidates, key=lambda candidate: abs(candidate[0] - event["time"]))
+                    if abs(beat - event["time"]) <= tolerance:
+                        item["beatTime"] = round(beat, 6)
+            annotated.append(item)
+        return annotated
     except Exception as exc:
-        logger.warning("No se pudo alinear acordes a beats: %s", exc)
+        logger.warning("Beat evidence unavailable; original chord times retained: %s", exc)
         return events
 
 
@@ -1432,7 +1282,13 @@ def detect_chords(audio_path: str, beat_source: str | None = None) -> list[dict]
             else:
                 events = _detect_chords_librosa(audio_path)
 
-            events = _postprocess_chord_events(events)
+            from timeline import normalize_events
+            from transcription_chunks import probe_audio_duration
+            try:
+                duration = probe_audio_duration(audio_path)
+            except Exception:
+                duration = None
+            events = normalize_events(_postprocess_chord_events(events), duration=duration)
             events = _snap_chords_to_beats(beat_source or audio_path, events)
             if events:
                 logger.info("Motor de acordes usado: %s", engine)
@@ -1491,326 +1347,43 @@ def _find_nearest_diatonic(chord: str, diatonic: set[str]) -> str | None:
 
 
 def _postprocess_chord_events(chord_events: list[dict]) -> list[dict]:
-    """Post-procesa eventos de acordes:
-    1. Ordena y fusiona duplicados inmediatos
-    2. Elimina parpadeos A→B→A donde B dura muy poco
-    3. Conserva acordes cromaticos reales: no fuerza sustituciones diatonicas
-    """
-    if len(chord_events) < 2:
-        return chord_events
-
-    ordered_events = sorted(
-        (
-            {"chord": event["chord"], "time": round(float(event["time"]), 2)}
-            for event in chord_events
-            if event.get("chord") is not None and event.get("time") is not None
-        ),
-        key=lambda event: (event["time"], event["chord"]),
-    )
-
-    if len(ordered_events) < 2:
-        return ordered_events
-
-    deduped = [ordered_events[0]]
-    for event in ordered_events[1:]:
-        prev = deduped[-1]
-        if event["chord"] == prev["chord"] and abs(event["time"] - prev["time"]) < 0.18:
-            continue
-        deduped.append(event)
-
-    # Calcular duracion de cada evento
-    for i in range(len(deduped)):
-        if i < len(deduped) - 1:
-            deduped[i]["_dur"] = deduped[i + 1]["time"] - deduped[i]["time"]
-        else:
-            deduped[i]["_dur"] = 999.0
-
-    # Eliminar parpadeos breves sin reescribir la armonia real
-    corrected = deduped
-    if len(corrected) >= 3:
-        filtered = [corrected[0]]
-        for i in range(1, len(corrected) - 1):
-            prev = filtered[-1]
-            curr = corrected[i]
-            nxt = corrected[i + 1]
-            if (prev["chord"] == nxt["chord"]
-                    and curr["chord"] != prev["chord"]
-                    and curr.get("_dur", 999) < 0.85):
-                continue
-            filtered.append(curr)
-        filtered.append(corrected[-1])
-        corrected = filtered
-
-    # Fusionar consecutivos iguales tras limpiar parpadeos
-    merged = [corrected[0]]
-    for event in corrected[1:]:
-        if event["chord"] == merged[-1]["chord"]:
-            continue
-        merged.append(event)
-
-    # Limpiar campo temporal
-    for event in merged:
-        event.pop("_dur", None)
-
-    logger.info("Post-proceso: %d → %d eventos", len(chord_events), len(merged))
-    return merged
+    """Preserve detector intervals, silence and short harmonic changes."""
+    from timeline import normalize_events
+    return normalize_events(chord_events)
 
 
 # ---------------------------------------------------------------------------
 # Paso 3: Sincronizacion letras + acordes
 # ---------------------------------------------------------------------------
-def _split_long_segments(segments: list[dict], max_len: int = 40, min_len: int = 15) -> list[dict]:
-    """Divide segmentos largos en lineas mas cortas, respetando frases naturales."""
-    result = []
-    for seg in segments:
-        text = seg["text"].strip()
-        if len(text) <= max_len:
-            result.append(seg)
-            continue
-
-        duration = seg["end"] - seg["start"]
-
-        # Buscar puntos de corte naturales: comas, puntos, punto y coma
-        split_chars = {",", ".", ";", "?", "!"}
-        candidates: list[int] = []
-        for idx, ch in enumerate(text):
-            if ch in split_chars and idx > 0:
-                candidates.append(idx + 1)  # incluir el signo de puntuacion
-
-        # Generar partes cortando en los puntos naturales
-        parts: list[str] = []
-        start_idx = 0
-        for cut in candidates:
-            part = text[start_idx:cut].strip()
-            rest = text[cut:].strip()
-            # Solo cortar si ambos lados quedan con longitud razonable
-            if len(part) >= min_len and len(rest) >= min_len:
-                parts.append(part)
-                start_idx = cut
-
-        # Agregar lo que quede
-        remaining = text[start_idx:].strip()
-        if remaining:
-            # Si lo que queda es muy largo, cortar por palabras
-            if len(remaining) > max_len:
-                words = remaining.split()
-                current = ""
-                for w in words:
-                    test = (current + " " + w).strip()
-                    if len(test) > max_len and len(current) >= min_len:
-                        parts.append(current)
-                        current = w
-                    else:
-                        current = test
-                if current:
-                    # No dejar fragmentos muy cortos solos
-                    if len(current) < min_len and parts:
-                        parts[-1] = parts[-1] + " " + current
-                    else:
-                        parts.append(current)
-            else:
-                # Si es corto pero hay partes previas y es muy pequeno, pegarlo a la anterior
-                if len(remaining) < min_len and parts:
-                    parts[-1] = parts[-1] + " " + remaining
-                else:
-                    parts.append(remaining)
-
-        if len(parts) <= 1:
-            result.append(seg)
-            continue
-
-        # Distribuir tiempos proporcionalmente
-        total_chars = sum(len(p) for p in parts)
-        time_cursor = seg["start"]
-        for part in parts:
-            part_dur = duration * (len(part) / max(total_chars, 1))
-            result.append({
-                "text": part.strip(),
-                "start": round(time_cursor, 3),
-                "end": round(time_cursor + part_dur, 3),
-            })
-            time_cursor += part_dur
-
-    return result
+def _split_long_segments(segments: list[dict], max_len: int = 40, min_len: int = 15,
+                         words: list[dict] | None = None) -> list[dict]:
+    """Split phrases at timestamped words, without estimating times by length."""
+    from timeline import split_segments
+    return split_segments(segments, words or [], max_len=max_len, min_len=min_len)
 
 
-def _time_to_char_index(
-    chord_time: float,
-    line_text: str,
-    line_start: float,
-    line_end: float,
-    words: list[dict],
-) -> int:
-    """Mapea timestamp de acorde a indice de caracter usando posiciones de palabras.
-
-    Si hay words con timestamps disponibles, busca la palabra mas cercana al
-    momento del acorde y calcula el charIndex real.  Fallback: interpolacion lineal.
-    """
-    # Filtrar palabras que pertenecen a esta linea (con tolerancia de 0.1s)
-    line_words = [
-        w for w in words
-        if w["start"] >= line_start - 0.1 and w["end"] <= line_end + 0.1
-    ]
-
-    if not line_words:
-        # Fallback: interpolacion lineal
-        seg_dur = max(line_end - line_start, 0.01)
-        rel = (chord_time - line_start) / seg_dur
-        return max(1, min(int(rel * len(line_text)), len(line_text) - 1))
-
-    # Mapear cada palabra a su posicion de caracter en line_text
-    search_from = 0
-    word_positions: list[dict] = []
-    text_lower = line_text.lower()
-    for w in line_words:
-        clean = w["word"].strip()
-        pos = text_lower.find(clean.lower(), search_from)
-        if pos == -1:
-            pos = search_from
-        word_positions.append({
-            "char_start": pos,
-            "char_end": pos + len(clean),
-            "time_start": w["start"],
-            "time_end": w["end"],
-        })
-        search_from = pos + len(clean)
-
-    # Buscar la palabra donde cae el acorde
-    for wp in word_positions:
-        if chord_time <= wp["time_start"]:
-            return max(1, wp["char_start"])
-        if wp["time_start"] <= chord_time <= wp["time_end"]:
-            # Interpolar dentro de la palabra
-            word_dur = max(wp["time_end"] - wp["time_start"], 0.01)
-            progress = (chord_time - wp["time_start"]) / word_dur
-            char_within = int(progress * (wp["char_end"] - wp["char_start"]))
-            return max(1, min(wp["char_start"] + char_within, len(line_text) - 1))
-
-    # El acorde cae despues de todas las palabras
-    return max(1, min(word_positions[-1]["char_end"], len(line_text) - 1))
+def _time_to_char_index(chord_time: float, line_text: str, line_start: float,
+                        line_end: float, words: list[dict]) -> int:
+    from timeline import time_to_char_index
+    return time_to_char_index(chord_time, line_text, line_start, line_end, words)
 
 
 def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
-    """Cruza letras (con tiempos) y acordes (con tiempos) en secciones estructuradas."""
-    segments = lyrics_data["segments"]
-    words = lyrics_data.get("words", [])
-    if not segments:
-        return {"sections": [], "detectedKey": "C", "keyType": "major"}
-
-    # Paso A: Dividir segmentos largos respetando frases naturales
-    segments = _split_long_segments(segments)
-
-    # Paso B: Asignar acordes a cada linea
-    sections: list[dict] = []
-    current_lines: list[dict] = []
-    section_counter = 1
-
-    for i, seg in enumerate(segments):
-        seg_chords: list[dict] = []
-
-        # Acorde activo al inicio: el ultimo acorde que suena ANTES o AL INICIO de esta linea
-        last_before = None
-        for chord_ev in chords_data:
-            if chord_ev["time"] <= seg["start"]:
-                last_before = chord_ev
-            else:
-                break
-        if last_before:
-            seg_chords.append({
-                "chord": last_before["chord"],
-                "charIndex": 0,
-                "_time": last_before["time"],
-            })
-
-        # Acordes que caen DENTRO del rango temporal de esta linea
-        for chord_ev in chords_data:
-            if seg["start"] < chord_ev["time"] < seg["end"]:
-                char_index = _time_to_char_index(
-                    chord_ev["time"], seg["text"], seg["start"], seg["end"], words,
-                )
-                seg_chords.append({
-                    "chord": chord_ev["chord"],
-                    "charIndex": char_index,
-                    "_time": chord_ev["time"],
-                })
-
-        # Acordes entre el fin de esta linea y el inicio de la siguiente (intermedios)
-        next_start = segments[i + 1]["start"] if i < len(segments) - 1 else seg["end"] + 999
-        for chord_ev in chords_data:
-            if seg["end"] <= chord_ev["time"] < next_start:
-                seg_chords.append({
-                    "chord": chord_ev["chord"],
-                    "charIndex": len(seg["text"]),
-                    "_time": chord_ev["time"],
-                })
-
-        # Deduplicar solo duplicados reales, sin descartar acordes distintos
-        seg_chords.sort(key=lambda chord: (chord.get("_time", 0), chord["charIndex"]))
-        unique_chords: list[dict] = []
-        for c in seg_chords:
-            normalized_char_index = max(0, int(c["charIndex"]))
-            if unique_chords:
-                prev = unique_chords[-1]
-                same_chord = c["chord"] == prev["chord"]
-                same_spot = abs(normalized_char_index - prev["charIndex"]) <= 1
-                if same_chord and same_spot:
-                    continue
-            unique_chords.append({
-                "chord": c["chord"],
-                "charIndex": normalized_char_index,
-                "_time": c.get("_time", 0),
-            })
-
-        # Enforcar espaciado minimo para evitar superposicion visual
-        if len(unique_chords) > 1:
-            spaced = [unique_chords[0]]
-            for c in unique_chords[1:]:
-                prev = spaced[-1]
-                min_pos = prev["charIndex"] + len(prev["chord"]) + 2
-                spaced.append({
-                    **c,
-                    "charIndex": max(c["charIndex"], min_pos),
-                })
-            unique_chords = spaced
-
-        for chord in unique_chords:
-            chord.pop("_time", None)
-
-        current_lines.append({
-            "lyrics": seg["text"],
-            "chords": unique_chords,
-            "timestamps": [],
-            "_startTime": round(float(seg["start"]), 3),
-        })
-
-        # Detectar cambio de seccion por pausa larga (> 2.5 segundos)
-        if i < len(segments) - 1:
-            pause = segments[i + 1]["start"] - seg["end"]
-            if pause > 2.5:
-                sections.append({
-                    "name": f"Verso {section_counter}",
-                    "lines": current_lines,
-                })
-                current_lines = []
-                section_counter += 1
-
-    if current_lines:
-        sections.append({"name": f"Verso {section_counter}", "lines": current_lines})
-
-    _detect_choruses(sections)
-
-    all_chords = [c["chord"] for c in chords_data if c.get("chord")]
+    """Build editor lines while retaining the original harmonic timeline."""
+    from timeline import build_sections, normalize_events
+    segments = _split_long_segments(lyrics_data.get("segments", []), words=lyrics_data.get("words", []))
+    timeline = normalize_events(chords_data, duration=lyrics_data.get("duration"))
+    sections = build_sections(segments, timeline)
+    all_chords = [event["chord"] for event in timeline if event["chord"] != "N"]
     detected_key, key_type = _detect_key(all_chords)
-
-    # Renombrar enarmonicos: A# -> Bb, D# -> Eb, etc. segun tonalidad
     if _use_flats(detected_key, key_type):
         detected_key = _to_flat(detected_key)
         for section in sections:
             for line in section["lines"]:
                 for chord in line["chords"]:
                     chord["chord"] = _to_flat(chord["chord"])
-
-    return {"sections": sections, "detectedKey": detected_key, "keyType": key_type}
+    return {"sections": sections, "detectedKey": detected_key, "keyType": key_type,
+            "chordTimeline": timeline}
 
 
 # ---------------------------------------------------------------------------

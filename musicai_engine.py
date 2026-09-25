@@ -38,8 +38,8 @@ API_BASE = "https://api.music.ai/v1"
 
 # Campos donde los modulos de Music.ai pueden reportar la etiqueta del acorde
 _CHORD_FIELDS = (
-    "chord_majmin", "chord_complex_pop", "chord_basic_pop",
-    "chord_complex_jazz", "chord_basic_jazz", "chord", "name", "label", "value",
+    "chord_complex_pop", "chord_complex_jazz", "chord_basic_pop",
+    "chord_basic_jazz", "chord", "chord_majmin", "name", "label", "value",
 )
 
 
@@ -160,32 +160,26 @@ def _as_items(payload, *container_keys):
 
 
 def _parse_chords(payload) -> list[dict]:
+    from timeline import normalize_events
     main = _main()
     items = _as_items(payload, "chords", "data", "annotations", "events", "progression")
-    events: list[dict] = []
+    events = []
     for item in items:
         if not isinstance(item, dict):
             continue
-        label = None
-        for field in _CHORD_FIELDS:
-            if item.get(field):
-                label = str(item[field])
-                break
+        label = next((str(item[field]) for field in _CHORD_FIELDS if item.get(field)), None)
         start = item.get("start", item.get("time", item.get("timestamp")))
         if label is None or start is None:
             continue
         chord = main._normalize_chord_label(label)
-        if chord is None:  # "N" / silencio armonico
+        if chord is None and label.strip().upper() not in {"N", "NOCHORD", "NONE"}:
             continue
-        events.append({"chord": chord, "time": round(float(start), 2)})
-
-    events.sort(key=lambda e: e["time"])
-    merged: list[dict] = []
-    for ev in events:
-        if merged and merged[-1]["chord"] == ev["chord"]:
-            continue
-        merged.append(ev)
-    return merged
+        event = {"chord": chord or "N", "time": start}
+        for key in ("end", "confidence", "strength"):
+            if item.get(key) is not None:
+                event[key] = item[key]
+        events.append(event)
+    return normalize_events(events)
 
 
 def _words_to_segments(words: list[dict], max_gap: float = 1.0) -> list[dict]:
@@ -290,44 +284,27 @@ def _parse_beats(payload) -> list[float]:
 # Post-proceso musical
 # ---------------------------------------------------------------------------
 def _snap_to_beats(events: list[dict], beats: list[float]) -> list[dict]:
-    """Ajusta cada cambio de acorde al beat mas cercano (si esta cerca)."""
+    """Keep measured intervals and add nearby beat evidence for later review."""
+    from bisect import bisect_left
     if len(beats) < 4 or not events:
         return events
-    gaps = [b - a for a, b in zip(beats, beats[1:]) if b > a]
+    beats = sorted(set(beats))
+    gaps = sorted(b - a for a, b in zip(beats, beats[1:]) if b > a)
     if not gaps:
         return events
-    gaps.sort()
-    median_gap = gaps[len(gaps) // 2]
-    tol = 0.35 * median_gap
-
-    snapped: list[dict] = []
-    for ev in events:
-        t = ev["time"]
-        # busqueda binaria simple del beat mas cercano
-        lo, hi = 0, len(beats) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if beats[mid] < t:
-                lo = mid + 1
-            else:
-                hi = mid
-        best = beats[lo]
-        if lo > 0 and abs(beats[lo - 1] - t) < abs(best - t):
-            best = beats[lo - 1]
-        if abs(best - t) <= tol:
-            t = best
-        snapped.append({"chord": ev["chord"], "time": round(float(t), 2)})
-
-    snapped.sort(key=lambda e: e["time"])
-    cleaned: list[dict] = []
-    for ev in snapped:
-        if cleaned and cleaned[-1]["chord"] == ev["chord"]:
-            continue
-        if cleaned and abs(cleaned[-1]["time"] - ev["time"]) < 1e-6:
-            cleaned[-1] = ev  # dos acordes en el mismo beat: gana el ultimo
-            continue
-        cleaned.append(ev)
-    return cleaned
+    tolerance = min(0.12, 0.2 * gaps[len(gaps) // 2])
+    annotated = []
+    for event in events:
+        item = dict(event)
+        if event.get("chord") not in {"N", None}:
+            index = bisect_left(beats, event["time"])
+            candidates = beats[max(0, index - 1):index + 1]
+            if candidates:
+                closest = min(candidates, key=lambda beat: abs(beat - event["time"]))
+                if abs(closest - event["time"]) <= tolerance:
+                    item["beatTime"] = float(closest)
+        annotated.append(item)
+    return annotated
 
 
 def _group_segments(segments: list[dict], sections: list[dict]):
@@ -348,7 +325,6 @@ def _group_segments(segments: list[dict], sections: list[dict]):
         if target is None:
             target = min(groups, key=lambda g: min(abs(mid - g["start"]), abs(mid - g["end"])))
         target["segments"].append(seg)
-    groups = [g for g in groups if g["segments"]]
     for g in groups:
         g["segments"].sort(key=lambda s: s["start"])
     return groups or None
@@ -370,102 +346,36 @@ def _group_by_pauses(segments: list[dict], pause: float = 2.5):
 
 
 def _build_sections(groups, chords: list[dict], words: list[dict]) -> list[dict]:
-    """Asigna acordes a cada linea y construye las secciones del SongEditor."""
+    """Render provider boundaries, including sections containing only instruments."""
+    from timeline import build_sections, normalize_events
     main = _main()
-    sections_out: list[dict] = []
-    last_line_chord: str | None = None
-
-    all_segments = [seg for g in groups for seg in g["segments"]]
-    seg_next_start: dict[int, float] = {}
-    for idx, seg in enumerate(all_segments):
-        seg_next_start[id(seg)] = (
-            all_segments[idx + 1]["start"] if idx + 1 < len(all_segments) else seg["end"] + 999.0
-        )
-
-    for g in groups:
-        lines: list[dict] = []
-        for j, seg in enumerate(g["segments"]):
-            seg_chords: list[dict] = []
-
-            # Acorde activo al inicio de la linea
-            active = None
-            for ev in chords:
-                if ev["time"] <= seg["start"] + 0.05:
-                    active = ev
-                else:
-                    break
-            if active and (j == 0 or active["chord"] != last_line_chord):
-                seg_chords.append({"chord": active["chord"], "charIndex": 0, "_time": active["time"]})
-
-            # Acordes dentro de la linea
-            for ev in chords:
-                if seg["start"] + 0.05 < ev["time"] < seg["end"]:
-                    ci = main._time_to_char_index(
-                        ev["time"], seg["text"], seg["start"], seg["end"], words,
-                    )
-                    seg_chords.append({"chord": ev["chord"], "charIndex": ci, "_time": ev["time"]})
-
-            # Acordes entre el final de la linea y la siguiente, acotados al
-            # final de la seccion: los acordes de un interludio pertenecen a la
-            # seccion siguiente (apareceran alli como acorde activo inicial).
-            next_start = seg_next_start[id(seg)]
-            boundary = min(next_start, g.get("end", float("inf")) + 0.25)
-            for ev in chords:
-                if seg["end"] <= ev["time"] < boundary:
-                    seg_chords.append({
-                        "chord": ev["chord"],
-                        "charIndex": len(seg["text"]),
-                        "_time": ev["time"],
-                    })
-
-            # Deduplicar y espaciar
-            seg_chords.sort(key=lambda c: (c.get("_time", 0), c["charIndex"]))
-            unique: list[dict] = []
-            for c in seg_chords:
-                ci = max(0, int(c["charIndex"]))
-                if unique and c["chord"] == unique[-1]["chord"] and abs(ci - unique[-1]["charIndex"]) <= 1:
-                    continue
-                unique.append({"chord": c["chord"], "charIndex": ci})
-            unique = structuring.respace(unique)
-
-            if unique:
-                last_line_chord = unique[-1]["chord"]
-            lines.append({
-                "lyrics": seg["text"],
-                "chords": unique,
-                "timestamps": [],
-                "_startTime": round(float(seg["start"]), 3),
-            })
-
-        if lines:
-            sections_out.append({"label": g.get("label", ""), "lines": lines})
-
-    # Nombres de seccion a partir de las etiquetas de Music.ai
-    verse_n = 0
-    chorus_seen = 0
-    labeled = 0
-    for section in sections_out:
-        base = SECTION_LABEL_MAP.get(section.pop("label", ""), None)
-        if base == "Verso":
-            verse_n += 1
-            section["name"] = f"Verso {verse_n}"
-            labeled += 1
-        elif base == "Coro":
-            chorus_seen += 1
-            section["name"] = "Coro"
-            labeled += 1
-        elif base:
-            section["name"] = base
-            labeled += 1
-        else:
-            verse_n += 1
-            section["name"] = f"Verso {verse_n}"
-
-    # Sin etiquetas utiles: aplicar deteccion de coros por similitud (legacy)
-    if labeled == 0 and len(sections_out) > 1:
-        main._detect_choruses(sections_out)
-
-    return sections_out
+    events = normalize_events(chords)
+    if not groups or not any("start" in group and "end" in group for group in groups):
+        segments = [segment for group in groups or [] for segment in group["segments"]]
+        return build_sections(main._split_long_segments(segments, words=words), events)
+    output = []
+    verse = 0
+    for group in groups:
+        start, end = group["start"], group["end"]
+        clipped = []
+        for event in events:
+            if event["time"] >= end or event.get("end", float("inf")) <= start:
+                continue
+            clipped.append({**event, "time": max(start, event["time"]),
+                            "end": min(end, event.get("end", end))})
+        segments = main._split_long_segments(group["segments"], words=words)
+        built = build_sections(segments, clipped)
+        lines = [line for section in built for line in section["lines"]]
+        if not lines:
+            # Keep the provider boundary even when it reports silence/no lyrics.
+            lines = [{"lyrics": "", "chords": [], "timestamps": [],
+                      "_startTime": start, "_endTime": end}]
+        label = SECTION_LABEL_MAP.get(group.get("label", ""))
+        if label == "Verso" or (label is None and any(line["lyrics"] for line in lines)):
+            verse += 1
+            label = f"Verso {verse}"
+        output.append({"name": label or "Instrumental", "lines": lines})
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -504,19 +414,19 @@ def process(audio_path: str) -> dict:
         len(lyrics["segments"]), len(lyrics["words"]), len(chords), len(sections_t), len(beats),
     )
 
-    if not lyrics["segments"]:
-        raise RuntimeError("Music.ai no devolvio letra utilizable")
+    if not lyrics["segments"] and not any(event["chord"] != "N" for event in chords):
+        raise RuntimeError("Music.ai no devolvio letra ni acordes utilizables")
 
     chords = _snap_to_beats(chords, beats)
 
-    segments = main._split_long_segments(lyrics["segments"])
+    segments = main._split_long_segments(lyrics["segments"], words=lyrics["words"])
     groups = _group_segments(segments, sections_t) or _group_by_pauses(segments)
     sections_out = _build_sections(groups, chords, lyrics["words"])
 
-    all_chords = [c["chord"] for c in chords]
+    all_chords = [c["chord"] for c in chords if c["chord"] != "N"]
     detected_key, key_type = main._detect_key(all_chords) if all_chords else ("C", "major")
 
-    sections_out = structuring.apply_structure(sections_out, detected_key, key_type)
+    sections_out = structuring.apply_structure(sections_out, detected_key, key_type, preserve_boundaries=bool(sections_t))
 
     # Enarmonia coherente con la tonalidad (A# -> Bb, etc.)
     if main._use_flats(detected_key, key_type):
@@ -532,4 +442,5 @@ def process(audio_path: str) -> dict:
         "keyType": key_type,
         "engine": "music.ai",
         "transcriptionModel": "music.ai",
+        "chordTimeline": chords,
     }

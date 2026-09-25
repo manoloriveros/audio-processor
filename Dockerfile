@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY main.py separation.py structuring.py musicai_engine.py ./
+COPY main.py separation.py structuring.py musicai_engine.py timeline.py transcription_chunks.py transcription_alignment.py transcription_service.py ./
 
 # Pre-descargar el modelo de separacion vocal (MDX-Net ONNX) en la imagen para
 # evitar la descarga en el primer request. Kim_Vocal_2: buen equilibrio

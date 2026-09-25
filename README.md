@@ -3,27 +3,65 @@
 Servicio FastAPI (Railway) que recibe un audio y devuelve la canción estructurada
 (secciones con líneas de letra + acordes con `charIndex`) para el SongEditor.
 
-## Pipeline (v2, jul-2026)
+## Pipeline (revisión de precisión, septiembre de 2026)
 
-```
-audio (mix)
-   │
-   ├─ Paso 0 · separación de stems (self-hosted, GRATIS) ── audio-separator (MDX-Net ONNX, CPU)
-   │      ├─ vocals.wav       → Paso 1
-   │      └─ instrumental.wav → Paso 2
-   │      (si falla/tarda/desactivada → se usa el mix en ambos pasos, como antes)
-   │
-   ├─ Paso 1 · letra ── whisper-1 (timestamps por palabra) + gpt-4o-transcribe
-   │                    (texto de calidad) alineados palabra a palabra
-   ├─ Paso 2 · acordes ── Chordino (NNLS Chroma + HMM) sobre el instrumental;
-   │                      fallback Librosa. Beat-snap con beats del MIX original
-   ├─ Paso 3 · sincronización ── acordes → charIndex por línea vía timestamps
-   └─ Paso 4 · estructura (LLM) ── gpt-4o-mini corrige ortografía litúrgica y
-                                   nombra secciones (Verso 1, Coro, Puente…)
-```
+1. Separación opcional de voz/instrumental con audio-separator. Si no hay stems,
+   el procesamiento continúa sobre la mezcla original.
+2. Transcripción por ventanas de 120 segundos, con 2 segundos de contexto a cada
+   lado. FFmpeg crea un solo WAV mono PCM16 de 16 kHz a la vez; incluso los audios
+   cortos se normalizan. Los tiempos vuelven al eje temporal de la grabación.
+3. La segunda transcripción solo corrige palabras cuando conserva su cantidad y
+   correspondencia. No se reparten tiempos inventados entre palabras nuevas ni
+   se elimina un coro porque el otro modelo lo haya resumido.
+4. Chordino (o el fallback configurado) conserva inversiones, cambios breves,
+   intervalos y eventos `N` sin armonía. Los beats de toda la grabación se analizan
+   por ventanas y se adjuntan como referencia, sin mover los tiempos detectados.
+5. Las líneas se cortan en tiempos reales de palabras cuando existen. Intro,
+   interludios y finales instrumentales conservan sus acordes. `charIndex` expresa
+   el anclaje musical; el espaciado para que las etiquetas no se tapen pertenece
+   al editor.
+6. La agrupación gratuita reconoce bloques de varias líneas repetidas y propone
+   coros aunque no haya pausas. La pasada LLM opcional puede reagrupar IDs de línea
+   consecutivos; se rechaza completa si pierde, duplica o reordena contenido. Solo
+   puede cambiar puntuación, mayúsculas y tildes, conservando los tiempos.
 
-Coste por canción de 4 min: **~$0.06** (2 transcripciones OpenAI + pasada mini).
-La separación y los acordes son locales (solo CPU de Railway).
+Los timestamps por palabra del proveedor siguen usando `whisper-1` con
+`verbose_json`; la pasada textual usa JSON, según la
+[documentación oficial de transcripción](https://developers.openai.com/api/docs/guides/speech-to-text).
+No se ha incorporado un proveedor de pago nuevo. La transcripción existente y la
+pasada LLM opcional siguen usando la API de OpenAI; esta revisión no las convierte
+súbitamente en procesamiento gratuito en el navegador. `LLM_STRUCTURE=0` permite
+usar únicamente la agrupación local de secciones y ahora es el valor por defecto.
+La pasada adicional requiere `LLM_STRUCTURE=1` explícito; una configuración
+existente con ese valor sigue teniendo prioridad.
+
+La respuesta conserva `chordTimeline` con `{chord, time, end?}` y metadatos del
+motor cuando existen. El pipeline local añade `analysisWarnings`,
+`analysisDuration` y `transcriptionChunks`. Los tiempos ausentes se marcan como
+estimados internamente; no producen marcadores de video de falsa precisión.
+Los acordes `N` quedan en la cronología y no se dibujan como acordes en la letra.
+
+### Límites y validación
+
+- Detectar una repetición textual no demuestra que sea un coro: un verso repetido
+  puede ser ambiguo. Variaciones o saltos de línea diferentes pueden impedir la
+  agrupación. Las secciones acústicas de Music.ai se conservan cuando existen.
+- Las ventanas acotan la memoria de transcripción y beats. Los detectores
+  Librosa/Essentia todavía cargan el audio completo. La separación conserva su
+  límite de 480 segundos por defecto, y YouTube su límite de 720 segundos.
+- La corrección textual conservadora prioriza no borrar contenido medido; puede
+  dejar sin aplicar una corrección útil que cambie la cantidad de palabras.
+- Los tiempos por palabra no son una alineación forzada específica para canto.
+  La posición dentro de una palabra sigue siendo aproximada. La cronología de
+  acordes se devuelve para diagnóstico, pero el editor guarda sus anclas de letra,
+  no esta cronología completa.
+- Las pruebas son de regresión, con respuestas simuladas y una prueba sintética
+  de conversión FFmpeg. No establecen un porcentaje de precisión musical ni
+  sustituyen una comparación con grabaciones largas anotadas.
+
+Para probar, instalar las dependencias del servicio y `pytest`, después usar
+`python -m pytest -q`. La conversión sintética requiere FFmpeg; usa metadatos de
+WAV conocidos para poder probar sin FFprobe. El servicio real requiere ambos.
 
 ## Endpoints
 
@@ -71,10 +109,10 @@ salidas en JSON con esos nombres → copiar el slug a `MUSIC_AI_WORKFLOW`.
 | Variable | Default | Descripción |
 |---|---|---|
 | `API_SECRET` | — | obligatoria; el backend la envía en `x-api-secret` |
-| `OPENAI_API_KEY` | — | obligatoria para letra y pasada de estructura |
+| `OPENAI_API_KEY` | — | necesaria para transcripción y pasada LLM opcional |
 | `OPENAI_TRANSCRIPTION_MODEL` | `gpt-4o-transcribe` | modelo de texto (pasada 2) |
 | `OPENAI_STRUCTURE_MODEL` | `gpt-4o-mini` | modelo de la pasada de estructura |
-| `LLM_STRUCTURE` | `1` | `0` desactiva la pasada de estructura |
+| `LLM_STRUCTURE` | `0` | `0` desactiva solo la pasada LLM; la agrupación local sigue activa |
 | `AUDIO_SEPARATION` | `1` | `0` desactiva la separación de stems |
 | `SEPARATION_MODEL` | `Kim_Vocal_2.onnx` | modelo MDX (ver `audio-separator --list_models`) |
 | `SEPARATION_TIMEOUT` | `210` | segundos máx. del subproceso de separación |
