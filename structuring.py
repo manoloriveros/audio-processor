@@ -199,12 +199,19 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
                     break
                 block_length += 1
             extended = tuple(keys[starts[0]:starts[0] + block_length])
+            # Two adjacent repeats alone cannot distinguish an opening verse
+            # repeated twice from a chorus. Retain the existing labels in that
+            # ambiguous case; acoustic labels are handled separately.
+            adjacent_pair = (len(starts) == 2 and not any(
+                line.get("lyrics", "").strip()
+                for line in lines[starts[0] + block_length:starts[1]]
+            ))
             if _meaningful_refrain(extended):
-                candidates.append((block_length * len(starts), block_length, starts))
+                candidates.append((block_length * len(starts), block_length, starts, not adjacent_pair))
     candidates.sort(key=lambda item: (-item[0], -item[1], item[2][0]))
     occupied: set[int] = set()
-    refrains: dict[int, int] = {}
-    for _, length, starts in candidates:
+    refrains: dict[int, tuple[int, bool]] = {}
+    for _, length, starts, chorus_candidate in candidates:
         available = [
             start for start in starts
             if all(index not in occupied for index in range(start, start + length))
@@ -212,7 +219,7 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
         if len(available) < 2:
             continue
         for start in available:
-            refrains[start] = start + length
+            refrains[start] = (start + length, chorus_candidate)
             occupied.update(range(start, start + length))
     if not refrains:
         return sections
@@ -222,13 +229,13 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
         source = sources[index]
         original = sections[source]
         is_refrain = index in refrains
-        end = refrains.get(index, index + 1)
+        end, chorus_candidate = refrains.get(index, (index + 1, False))
         if not is_refrain:
             while end < len(lines) and sources[end] == source and end not in refrains:
                 end += 1
         section = {key: deepcopy(value) for key, value in original.items() if key != "lines"}
         section["lines"] = deepcopy(lines[index:end])
-        if is_refrain:
+        if is_refrain and chorus_candidate:
             section["name"] = "Coro"
         elif _section_kind(original.get("name", "")) == "Verso":
             verse_number += 1

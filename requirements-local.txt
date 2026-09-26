@@ -1,0 +1,3 @@
+# Optional transcription engine; install alongside the existing service dependencies.
+# The weights are prepared separately, not downloaded during an HTTP request.
+faster-whisper==1.2.1

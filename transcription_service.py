@@ -60,7 +60,7 @@ def transcribe_chunk(client, audio_path, *, timestamp_model, text_models, prompt
             response = client.audio.transcriptions.create(
                 model=timestamp_model, file=audio, response_format="verbose_json",
                 timestamp_granularities=["word", "segment"], language="es",
-                prompt=prompt, temperature=0,
+                **({"prompt": prompt} if prompt else {}), temperature=0,
             )
         timestamp_succeeded = True
         timed_text = str(_field(response, "text", "") or "").strip()
@@ -79,7 +79,7 @@ def transcribe_chunk(client, audio_path, *, timestamp_model, text_models, prompt
                 with open(audio_path, "rb") as audio:
                     response = client.audio.transcriptions.create(
                         model=candidate, file=audio, response_format="json",
-                        language="es", prompt=prompt, temperature=0,
+                        language="es", **({"prompt": prompt} if prompt else {}), temperature=0,
                     )
                 corrected_text = str(_field(response, "text", "") or "").strip()
                 text_model = candidate

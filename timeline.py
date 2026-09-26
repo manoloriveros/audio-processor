@@ -10,6 +10,10 @@ import unicodedata
 from bisect import bisect_right
 from difflib import SequenceMatcher
 
+# Short vocal rests occur inside musical phrases. This is a conservative layout
+# threshold, not an acoustic verse/chorus classifier.
+SECTION_REST_SECONDS = 8.0
+
 
 def _number(value):
     try:
@@ -145,6 +149,14 @@ def build_sections(segments, events):
     events = normalize_events(events)
     starts = [event["time"] for event in events]
 
+    def placed_chord(event, anchor, source):
+        # Keep the measured onset even when presentation repeats a held chord or
+        # places a rest at the end of a line. charIndex is not an audio timestamp.
+        return {"chord": event["chord"], "charIndex": anchor,
+                "audioTime": event["time"], "alignmentSource": source,
+                **({"audioEnd": event["end"]} if "end" in event else {}),
+                **({"extensionNeedsReview": True} if event.get("extensionNeedsReview") else {})}
+
     def in_span(start, end):
         index = bisect_right(starts, start) - 1
         chosen = []
@@ -168,7 +180,7 @@ def build_sections(segments, events):
             group = chosen[offset:offset + 8]
             cursor, chords = 0, []
             for event in group:
-                chords.append({"chord": event["chord"], "charIndex": cursor})
+                chords.append(placed_chord(event, cursor, "instrumental"))
                 cursor += len(event["chord"]) + 2
             line_end = chosen[offset + 8]["time"] if offset + 8 < len(chosen) else end
             lines.append({"lyrics": "", "chords": chords, "timestamps": [],
@@ -182,6 +194,7 @@ def build_sections(segments, events):
 
     sections, current = [], []
     verse = 0
+    last_rendered_event = None
 
     def flush():
         nonlocal current, verse
@@ -200,19 +213,28 @@ def build_sections(segments, events):
     for index, segment in enumerate(segments):
         start, end = segment["start"], segment["end"]
         next_start = segments[index + 1]["start"] if index + 1 < len(segments) else max(end, known_end)
-        gap_events = [event for event in in_span(end, next_start) if event["time"] >= end]
         is_last = index + 1 == len(segments)
-        separate_gap = bool(gap_events) and (next_start - end >= 1 or is_last)
+        gap_duration = next_start - end
+        separate_gap = bool(in_span(end, next_start)) and gap_duration >= SECTION_REST_SECONDS
         chord_end = end if separate_gap else max(end, next_start)
         chords = []
         for event in in_span(start, chord_end):
+            # An ongoing chord was already shown on the preceding lyric line.
+            # Do not turn one held chord into many apparent harmonic changes.
+            if (current and event["time"] < start
+                    and last_rendered_event == (event["time"], event["chord"])):
+                continue
+            last_rendered_event = (event["time"], event["chord"])
             if event["time"] <= start:
                 anchor = 0
+                source = "held" if event["time"] < start else "line-start"
             elif event["time"] >= end:
                 anchor = len(segment["text"])
+                source = "vocal-rest"
             else:
                 anchor = time_to_char_index(event["time"], segment["text"], start, end, segment.get("_words", []))
-            chords.append({"chord": event["chord"], "charIndex": anchor})
+                source = "word-timestamps" if segment.get("_words") else "segment-estimate"
+            chords.append(placed_chord(event, anchor, source))
         current.append({"lyrics": segment["text"], "chords": chords, "timestamps": [],
                         "_startTime": start, "_endTime": end,
                         **{key: segment[key] for key in ("timing_estimated", "timestamp_source")
@@ -222,7 +244,7 @@ def build_sections(segments, events):
             gap = instrumental(end, next_start, "Final" if is_last else "Instrumental")
             if gap:
                 sections.append(gap)
-        elif not is_last and next_start - end > 2.5:
+        elif not is_last and gap_duration >= SECTION_REST_SECONDS:
             flush()
     flush()
     return sections

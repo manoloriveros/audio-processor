@@ -51,7 +51,7 @@ def test_silence_does_not_extend_the_previous_chord_into_lyrics():
     result = main.synchronize({"segments": [{"text": "voz sola", "start": 3, "end": 4}], "words": []},
                               [{"chord": "C", "time": 0, "end": 2}, {"chord": "G", "time": 5, "end": 8}])
     vocal = next(line for section in result["sections"] for line in section["lines"] if line["lyrics"])
-    assert vocal["chords"] == []
+    assert all(chord["charIndex"] >= len(vocal["lyrics"]) for chord in vocal["chords"])  # solo tras el final de la voz
     assert result["chordTimeline"][1] == {"chord": "N", "time": 2, "end": 5}
 
 
@@ -123,7 +123,9 @@ def test_visual_chord_label_width_does_not_change_lyric_anchor():
                               [{"chord": "Cmaj7", "time": 0}, {"chord": "G", "time": 1.01}])
     vocal = next(line for section in result["sections"] for line in section["lines"] if line["lyrics"])
     expected = main._time_to_char_index(1.01, "aleluya", 1, 8, [])
-    assert vocal["chords"][1] == {"chord": "G", "charIndex": expected}
+    assert vocal["chords"][1]["chord"] == "G"
+    assert vocal["chords"][1]["charIndex"] == expected
+    assert vocal["chords"][1]["audioTime"] == 1.01
     assert expected < 2
 
 

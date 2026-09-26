@@ -1,7 +1,8 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
-ENV CHORD_ENGINE=chordino
+ENV CHORD_ENGINE=auto
+ENV CHORDMINI_MODEL_DIR=/models/chordmini
 
 # ffmpeg y librerias de sistema para Chordino + Librosa + audio-separator
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,7 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY main.py separation.py structuring.py musicai_engine.py timeline.py transcription_chunks.py transcription_alignment.py transcription_service.py ./
+COPY main.py separation.py structuring.py musicai_engine.py timeline.py transcription_chunks.py transcription_alignment.py transcription_service.py local_transcription.py chordmini.py chord_evidence.py THIRD_PARTY_CHORDMINI.txt ./
+
+# Pin and verify the free chord model at build time, never during a request.
+RUN python chordmini.py --download
 
 # Pre-descargar el modelo de separacion vocal (MDX-Net ONNX) en la imagen para
 # evitar la descarga en el primer request. Kim_Vocal_2: buen equilibrio

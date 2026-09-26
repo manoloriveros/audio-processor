@@ -94,10 +94,11 @@ def test_group_segments_and_sections():
     built = me._build_sections(groups, chords, words=[])
     assert [s["name"] for s in built] == ["Verso 1", "Instrumental", "Coro"], built
     first_line = built[0]["lines"][0]
-    assert first_line["chords"][0] == {"chord": "Dm", "charIndex": 0}
-    # Conservar acorde activo y cambio dentro de la segunda linea
+    assert first_line["chords"][0] == {"chord": "Dm", "charIndex": 0,
+        "audioTime": 0.5, "audioEnd": 4.5, "alignmentSource": "held"}
+    # No repetir el acorde sostenido que ya aparece en la linea anterior
     second_line = built[0]["lines"][1]
-    assert [c["chord"] for c in second_line["chords"]] == ["Dm", "A#"], second_line
+    assert [c["chord"] for c in second_line["chords"]] == ["A#"], second_line
     # coro: C activo al inicio de la seccion aunque venga de antes
     coro_line = next(line for line in built[2]["lines"] if line["lyrics"])
     assert coro_line["chords"][0]["chord"] == "C"
@@ -154,9 +155,9 @@ def test_legacy_synchronize_end_to_end():
     ]
     result = main.synchronize(lyrics_data, chords_data)
     assert result["detectedKey"] == "G"
-    assert len(result["sections"]) == 2  # pausa de 4s → dos secciones
+    assert len(result["sections"]) == 1  # Una pausa vocal de 4s no demuestra cambio de seccion
     line1 = result["sections"][0]["lines"][0]
-    assert line1["chords"][0] == {"chord": "G", "charIndex": 0}
+    assert line1["chords"][0] == {"chord": "G", "charIndex": 0, "audioTime": 0.5, "audioEnd": 2.4, "alignmentSource": "held"}
     c_chord = [c for c in line1["chords"] if c["chord"] == "C"]
     assert c_chord and 7 <= c_chord[0]["charIndex"] <= 16, line1["chords"]
 

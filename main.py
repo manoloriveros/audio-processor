@@ -27,7 +27,8 @@ from pydantic import BaseModel
 API_SECRET = os.getenv("API_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
-CHORD_ENGINE = os.getenv("CHORD_ENGINE", "chordino").strip().lower()
+TRANSCRIPTION_ENGINE = os.getenv("TRANSCRIPTION_ENGINE", "openai").strip().lower()
+CHORD_ENGINE = os.getenv("CHORD_ENGINE", "auto").strip().lower()
 CHORDINO_ROLL_ON = float(os.getenv("CHORDINO_ROLL_ON", "1"))
 CHORDINO_BOOST_N = float(os.getenv("CHORDINO_BOOST_N", "0.05"))
 
@@ -180,6 +181,11 @@ def _normalize_chord_label(chord_name: str | None) -> str | None:
         "aug": "aug",
         "m7b5": "m7b5",
         "min7b5": "m7b5",
+        "hdim7": "m7b5",
+        "min6": "m6",
+        "maj6": "6",
+        "minmaj7": "mMaj7",
+        "mmaj7": "mMaj7",
     }
     normalized_quality = quality_map.get(quality.lower(), quality)
 
@@ -258,10 +264,12 @@ for _i, _note in enumerate(NOTES):
 # ---------------------------------------------------------------------------
 def run_pipeline(audio_path: str) -> dict:
     """Ejecuta el pipeline completo sobre un archivo de audio local."""
+    if TRANSCRIPTION_ENGINE not in {"openai", "faster-whisper"}:
+        raise ValueError(f"Motor de transcripcion no reconocido: {TRANSCRIPTION_ENGINE}")
     result = None
 
     # Motor premium opcional: solo se usa si MUSIC_AI_API_KEY esta configurada
-    if musicai_engine is not None and musicai_engine.is_configured():
+    if TRANSCRIPTION_ENGINE != "faster-whisper" and musicai_engine is not None and musicai_engine.is_configured():
         try:
             result = musicai_engine.process(audio_path)
         except Exception as exc:
@@ -283,13 +291,24 @@ def run_pipeline(audio_path: str) -> dict:
             result = synchronize(lyrics_data, chords_data)
             result["transcriptionModel"] = lyrics_data.get("model")
             result["analysisWarnings"] = lyrics_data.get("warnings", [])
+            used_engine = next((event.get("engine") for event in chords_data if event.get("engine")), None)
+            result["chordEngine"] = used_engine
+            if CHORD_ENGINE in {"auto", "default", "chordmini"} and used_engine != "chordmini":
+                result["analysisWarnings"] = [*result["analysisWarnings"],
+                    "El modelo de acordes ChordMini no estuvo disponible; se usó un detector alternativo."]
+            if not chords_data:
+                result["analysisWarnings"] = [*result["analysisWarnings"], "No se pudieron detectar los acordes."]
             result["analysisDuration"] = lyrics_data.get("duration")
             result["transcriptionChunks"] = lyrics_data.get("chunkCount", 1)
             result["engine"] = "self-hosted+stems" if vocals_path else "self-hosted"
             if structuring is not None:
-                result["sections"] = structuring.apply_structure(
-                    result["sections"], result["detectedKey"], result["keyType"],
-                )
+                if TRANSCRIPTION_ENGINE == "faster-whisper":
+                    # Local mode never silently bills a configured editorial API.
+                    result["sections"] = structuring.infer_repeated_sections(result["sections"])
+                else:
+                    result["sections"] = structuring.apply_structure(
+                        result["sections"], result["detectedKey"], result["keyType"],
+                    )
         finally:
             if stems_dir:
                 import shutil as _shutil
@@ -567,15 +586,19 @@ async def health():
         available.insert(0, "chordino")
     if _ESSENTIA_AVAILABLE:
         available.append("essentia")
+    import chordmini
+    if chordmini.is_available():
+        available.insert(0, "chordmini")
     return {
         "status": "ok",
         "configuredEngine": CHORD_ENGINE,
         "availableEngines": available,
+        "transcriptionEngine": TRANSCRIPTION_ENGINE,
         "stemSeparation": bool(separation and separation.is_available()),
         "youtubeProxy": bool(os.getenv("YTDLP_PROXY")),
         "youtubeCookies": bool(os.getenv("YTDLP_COOKIES_B64")),
-        "llmStructure": bool(OPENAI_API_KEY and os.getenv("LLM_STRUCTURE", "0") != "0"),
-        "musicai": bool(musicai_engine and musicai_engine.is_configured()),
+        "llmStructure": bool(TRANSCRIPTION_ENGINE != "faster-whisper" and OPENAI_API_KEY and os.getenv("LLM_STRUCTURE", "0") != "0"),
+        "musicai": bool(TRANSCRIPTION_ENGINE != "faster-whisper" and musicai_engine and musicai_engine.is_configured()),
     }
 
 
@@ -591,7 +614,7 @@ async def process_audio(
     if not x_api_secret or not _secrets.compare_digest(x_api_secret, API_SECRET):
         raise HTTPException(status_code=401, detail="No autorizado")
 
-    if not OPENAI_API_KEY:
+    if TRANSCRIPTION_ENGINE == "openai" and not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
 
     allowed = {
@@ -684,7 +707,7 @@ async def process_url(
         raise HTTPException(status_code=503, detail="Servicio no configurado")
     if not x_api_secret or not _secrets.compare_digest(x_api_secret, API_SECRET):
         raise HTTPException(status_code=401, detail="No autorizado")
-    if not OPENAI_API_KEY:
+    if TRANSCRIPTION_ENGINE == "openai" and not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
 
     video_id = _extract_youtube_id(body.url)
@@ -721,16 +744,10 @@ async def process_url(
 # ---------------------------------------------------------------------------
 # Paso 1: Transcripcion con Whisper
 # ---------------------------------------------------------------------------
-WHISPER_PROMPT = (
-    "Cancion cristiana catolica cantada en espanol. "
-    "Es una interpretacion vocal musical, no habla conversacional. "
-    "Puede haber melismas, vocales sostenidas y silabas alargadas por el canto. "
-    "Transcribe la palabra real y canonica, sin repetir letras por el sostenido musical. "
-    "No inventes palabras por adornos melodicos ni por respiraciones. "
-    "La cancion tiene versos y coros que se repiten varias veces; conserva las repeticiones reales. "
-    "Vocabulario frecuente: Señor, Dios, Jesús, Cristo, Espíritu Santo, María, aleluya, amén, "
-    "cordero, gloria, bendito, misericordia, alabanza, adoración."
-)
+# A vocabulary list can leak words absent from an instrumental passage. Whisper
+# does not follow instruction-style prompts; do not seed it with imagined lyrics.
+WHISPER_PROMPT = None
+
 
 TRANSCRIPTION_TIMESTAMP_MODEL = "whisper-1"  # unico modelo de OpenAI con timestamps por palabra
 
@@ -816,6 +833,11 @@ def _parse_transcription_words(response) -> list[dict]:
 
 def transcribe_with_whisper(audio_path: str) -> dict:
     """Transcribe bounded mono chunks, retaining their original audio times."""
+    if TRANSCRIPTION_ENGINE == "faster-whisper":
+        from local_transcription import transcribe_local_audio
+        return transcribe_local_audio(audio_path)
+    if TRANSCRIPTION_ENGINE != "openai":
+        raise ValueError(f"Motor de transcripcion no reconocido: {TRANSCRIPTION_ENGINE}")
     from transcription_service import transcribe_audio
     result = transcribe_audio(
         audio_path, api_key=OPENAI_API_KEY,
@@ -1199,8 +1221,8 @@ def _detect_chords_librosa(audio_path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 def _configured_engine_sequence() -> list[str]:
     """Resuelve el orden de motores segun CHORD_ENGINE."""
-    if CHORD_ENGINE in {"auto", "default"}:
-        return ["chordino", "librosa"]
+    if CHORD_ENGINE in {"auto", "default", "chordmini"}:
+        return ["chordmini", "chordino", "librosa"]
     if CHORD_ENGINE in {"chordino", "nnls"}:
         return ["chordino", "librosa"]
     if CHORD_ENGINE == "librosa":
@@ -1275,7 +1297,21 @@ def detect_chords(audio_path: str, beat_source: str | None = None) -> list[dict]
             continue
 
         try:
-            if engine == "chordino":
+            if engine == "chordmini":
+                import chordmini
+                events = chordmini.detect(audio_path)
+                events = [{**event, "chord": _normalize_chord_label(event["chord"]) or "N"}
+                          for event in events]
+                if CHORD_ENGINE in {"auto", "default"} and _CHORDINO_AVAILABLE:
+                    try:
+                        from chord_evidence import retain_supported_sevenths
+                        from timeline import normalize_events
+                        secondary = normalize_events(_detect_chords_chordino(audio_path),
+                                                     duration=events[-1]["end"] if events else None)
+                        events = retain_supported_sevenths(events, secondary)
+                    except Exception as exc:
+                        logger.warning("Contraste de septimas no disponible; se conserva ChordMini: %s", exc)
+            elif engine == "chordino":
                 events = _detect_chords_chordino(audio_path)
             elif engine == "essentia":
                 events = _detect_chords_essentia(audio_path)
@@ -1292,7 +1328,7 @@ def detect_chords(audio_path: str, beat_source: str | None = None) -> list[dict]
             events = _snap_chords_to_beats(beat_source or audio_path, events)
             if events:
                 logger.info("Motor de acordes usado: %s", engine)
-                return events
+                return [{**event, "engine": engine} for event in events]
             logger.warning("Motor %s no produjo acordes; probando siguiente motor", engine)
         except Exception as e:
             last_error = e
@@ -1374,8 +1410,13 @@ def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
     segments = _split_long_segments(lyrics_data.get("segments", []), words=lyrics_data.get("words", []))
     timeline = normalize_events(chords_data, duration=lyrics_data.get("duration"))
     sections = build_sections(segments, timeline)
-    all_chords = [event["chord"] for event in timeline if event["chord"] != "N"]
-    detected_key, key_type = _detect_key(all_chords)
+    harmonic_events = [event for event in timeline if event["chord"] != "N"]
+    all_chords = [event["chord"] for event in harmonic_events]
+    # Legacy integrations sometimes omit the final duration. Do not invent a
+    # one-second tail and bias the key against a possibly long final chord.
+    durations = ([max(0., event["end"] - event["time"]) for event in harmonic_events]
+                 if all("end" in event for event in harmonic_events) else None)
+    detected_key, key_type = _detect_key(all_chords, durations)
     if _use_flats(detected_key, key_type):
         detected_key = _to_flat(detected_key)
         for section in sections:
@@ -1428,14 +1469,16 @@ def _detect_choruses(sections: list[dict]) -> None:
             verse_n += 1
 
 
-def _detect_key(chord_names: list[str]) -> tuple[str, str]:
-    """Detecta la tonalidad mas probable a partir de la frecuencia de acordes."""
+def _detect_key(chord_names: list[str], durations: list[float] | None = None) -> tuple[str, str]:
+    """Weight harmonic evidence by duration, independent of event fragmentation."""
     if not chord_names:
         return "C", "major"
 
     # Normalizar: "Am7" -> "Am", "G7" -> "G", "Cmaj7" -> "C", etc.
-    freq: dict[str, int] = {}
-    for name in chord_names:
+    freq: dict[str, float] = {}
+    if durations is not None and len(durations) != len(chord_names):
+        raise ValueError("Chord names and durations must correspond")
+    for index, name in enumerate(chord_names):
         # Extraer solo root + m/dim para el analisis de tonalidad
         normalized = _normalize_chord_label(name) or name
         main = normalized.split("/", 1)[0]
@@ -1443,13 +1486,15 @@ def _detect_key(chord_names: list[str]) -> tuple[str, str]:
         if not root:
             continue
         quality_l = quality.lower()
-        if quality_l in {"m", "m7", "m6", "m9", "min", "min7"}:
+        if quality_l in {"m", "m7", "m6", "m9", "min", "min7", "mmaj7"}:
             base = root + "m"
         elif quality_l in {"dim", "m7b5"}:
             base = root + "dim"
         else:
             base = root
-        freq[base] = freq.get(base, 0) + 1
+        weight = float(durations[index]) if durations is not None else 1.
+        if np.isfinite(weight) and weight > 0:
+            freq[base] = freq.get(base, 0) + weight
 
     major_intervals = [0, 2, 4, 5, 7, 9, 11]
     minor_intervals = [0, 2, 3, 5, 7, 8, 10]

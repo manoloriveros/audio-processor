@@ -23,7 +23,8 @@ def test_long_recording_preserves_all_refrains_and_timeline(monkeypatch):
     monkeypatch.setattr(main, 'musicai_engine', None)
     monkeypatch.setattr(main, 'separation', SimpleNamespace(separate=lambda path: (None, None, None)))
     monkeypatch.setattr(main, 'transcribe_with_whisper', lambda path: deepcopy(transcript))
-    monkeypatch.setattr(main, 'detect_chords', lambda *args, **kwargs: deepcopy(chords))
+    monkeypatch.setattr(main, 'detect_chords', lambda *args, **kwargs: [
+        {**event, 'engine': 'chordmini'} for event in deepcopy(chords)])
     monkeypatch.setenv('LLM_STRUCTURE', '0')
     result = main.run_pipeline('long-recording.wav')
     result = main._finalize_timestamps(result, attach=True)

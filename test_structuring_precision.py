@@ -132,7 +132,7 @@ def test_instrumental_sections_and_all_chords_survive_grouping():
     sections = [intro, {"name": "Verso 1", "lines": [line(text, i + 1) for i, text in enumerate(REFRAIN)]},
                 bridge, {"name": "Verso 2", "lines": [line(text, i + 6) for i, text in enumerate(REFRAIN)]}]
     result = structuring.apply_structure(sections, "C", "major")
-    assert [section["name"] for section in result] == ["Intro", "Coro", "Instrumental", "Coro"]
+    assert [section["name"] for section in result] == ["Intro", "Verso 1", "Instrumental", "Verso 2"]
     assert result[0] == intro and result[2] == bridge
     assert flatten(result) == flatten(sections)
 
@@ -281,7 +281,7 @@ def test_llm_disabled_never_constructs_client(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "unused-test-key")
     sections = song(REFRAIN * 2)
     result = structuring.apply_structure(sections, "C", "major")
-    assert [section["name"] for section in result] == ["Coro", "Coro"]
+    assert [section["name"] for section in result] == ["Verso 1", "Verso 2"]
 
 
 def test_paid_editorial_pass_is_opt_in_even_with_transcription_key(monkeypatch):
