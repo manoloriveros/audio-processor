@@ -314,3 +314,33 @@ un bloque largo de verso repetido dos veces. Al reconstruir frases divididas,
 cada fragmento debe aportar palabras de la frase conocida: esto evita tomar una
 línea ajena del verso previo. Las variantes de un inicio doble del coro pueden
 reconocerse solo dentro de un patrón completo respaldado por otras frases.
+
+## Validación del modelo Whisper, 26/09/2026
+
+El modelo local sigue siendo large-v3-turbo, con ventanas de 120 segundos y dos
+segundos de contexto. Se comparó la voz separada de la grabación completa de
+Athenas con large-v3 completo y con Turbo en ventanas de 60 segundos. En los tres
+versos de referencia aportados por el usuario (77 palabras, sin contar diferencias
+de mayúsculas, tildes o puntuación), el perfil anterior tuvo 2 errores, large-v3
+10, y Turbo/60 0. El resultado de 60 segundos se fragmentó en 34 secciones con el
+agrupador actual, frente a 16 del perfil anterior. Large-v3 omitió la frase
+«Limpia mis heridas con tu gracia» y parte de la siguiente. Por eso NO se cambia
+el modelo ni se promueve el tamaño de ventana de 60 segundos como predeterminado.
+Estos resultados son de una grabación y una referencia parcial, no una medida de
+precisión sobre toda la canción ni sobre otras canciones.
+
+`LOCAL_WHISPER_CHUNK_SECONDS` permite ensayos controlados (120 por defecto).
+La respuesta incluye `transcriptionChunkSeconds` en el modo local, y `/health`
+informa `transcriptionEngine`, `transcriptionModel` y `transcriptionTextModel`.
+El modelo del estado es la configuración elegida, no una prueba de que sus pesos
+estén preparados; la respuesta de una transcripción incluye la identificación
+real usada. El estado no carga pesos grandes ni llama a un proveedor.
+
+`local-transcription.env.example` muestra el perfil gratuito evaluado. Exportar
+sus variables, instalar requirements-local.txt, preparar los pesos y mantener la
+misma caché al iniciar el servicio. Este archivo no se lee automáticamente.
+Una variable explícita LOCAL_WHISPER_MODEL sigue teniendo prioridad. El Docker
+por defecto conserva el modo OpenAI; añadir este archivo no cambia una instancia
+remota a inferencia local ni instala faster-whisper en esa imagen. La comprobación
+del servicio configurado desde SongEditor no respondió en este ensayo, por lo que
+no se pudo confirmar su motor activo. No se hicieron transcripciones de pago.

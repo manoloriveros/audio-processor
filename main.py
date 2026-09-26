@@ -302,6 +302,7 @@ def run_pipeline(audio_path: str) -> dict:
                 result["analysisWarnings"] = [*result["analysisWarnings"], "No se pudieron detectar los acordes."]
             result["analysisDuration"] = lyrics_data.get("duration")
             result["transcriptionChunks"] = lyrics_data.get("chunkCount", 1)
+            result["transcriptionChunkSeconds"] = lyrics_data.get("chunkSeconds")
             result["transcriptionReviewSegments"] = lyrics_data.get("reviewSegments", [])
             result["engine"] = "self-hosted+stems" if vocals_path else "self-hosted"
             if structuring is not None:
@@ -597,6 +598,11 @@ async def health():
         "configuredEngine": CHORD_ENGINE,
         "availableEngines": available,
         "transcriptionEngine": TRANSCRIPTION_ENGINE,
+        "transcriptionModel": (os.getenv("LOCAL_WHISPER_MODEL", "large-v3-turbo")
+                               if TRANSCRIPTION_ENGINE == "faster-whisper"
+                               else TRANSCRIPTION_TIMESTAMP_MODEL),
+        "transcriptionTextModel": (None if TRANSCRIPTION_ENGINE == "faster-whisper"
+                                   else OPENAI_TRANSCRIPTION_MODEL),
         "stemSeparation": bool(separation and separation.is_available()),
         "youtubeProxy": bool(os.getenv("YTDLP_PROXY")),
         "youtubeCookies": bool(os.getenv("YTDLP_COOKIES_B64")),

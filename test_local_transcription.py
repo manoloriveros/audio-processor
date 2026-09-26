@@ -101,3 +101,44 @@ def test_local_endpoints_work_without_openai_key_and_still_require_secret(monkey
         assert client.post(route, **payload).status_code == 401
         response = client.post(route, headers={'x-api-secret': 'local-test-secret'}, **payload)
         assert response.status_code == 200, response.text
+
+@pytest.mark.parametrize('engine,expected_model,expected_text', [
+    ('faster-whisper', 'large-v3', None),
+    ('openai', 'whisper-1', 'gpt-4o-transcribe'),
+])
+def test_health_exposes_transcription_model_without_loading_weights(monkeypatch, engine, expected_model, expected_text):
+    monkeypatch.setattr(main, 'TRANSCRIPTION_ENGINE', engine)
+    monkeypatch.setattr(main, 'OPENAI_TRANSCRIPTION_MODEL', 'gpt-4o-transcribe')
+    monkeypatch.setenv('LOCAL_WHISPER_MODEL', 'large-v3')
+    monkeypatch.setattr(local, '_load_model', Mock(side_effect=AssertionError('Health must not load gigabyte weights')))
+    with TestClient(main.app) as client:
+        data = client.get('/health').json()
+    assert data['transcriptionEngine'] == engine
+    assert data['transcriptionModel'] == expected_model
+    assert data['transcriptionTextModel'] == expected_text
+
+@pytest.mark.parametrize('explicit,expected', [(None, 60), (90, 90)])
+def test_local_chunk_configuration_is_applied_and_explicit_argument_takes_priority(monkeypatch, explicit, expected):
+    calls = []
+    @contextmanager
+    def configured_chunks(*args, **kwargs):
+        calls.append(kwargs)
+        yield iter([AudioChunk('song.wav', 0, 0, 0, 10, 10, True)])
+    monkeypatch.setenv('LOCAL_WHISPER_CHUNK_SECONDS', '60')
+    monkeypatch.setattr(local, 'iter_audio_chunks', configured_chunks)
+    monkeypatch.setattr(local, '_load_model', lambda **_: SimpleNamespace(
+        transcribe=lambda *args, **kwargs: (iter([_segment('Volver', 1, 2)]), None)))
+    result = local.transcribe_local_audio('song.mp3', chunk_seconds=explicit)
+    assert calls[0]['chunk_seconds'] == expected
+    assert calls[0]['overlap_seconds'] == 2
+    assert result['chunkSeconds'] == expected
+    assert result['overlapSeconds'] == 2
+
+
+def test_invalid_local_chunk_text_fails_without_loading_a_model(monkeypatch):
+    monkeypatch.setenv('LOCAL_WHISPER_CHUNK_SECONDS', 'not-seconds')
+    model = Mock(side_effect=AssertionError('Invalid configuration must not load weights'))
+    monkeypatch.setattr(local, '_load_model', model)
+    with pytest.raises(ValueError):
+        local.transcribe_local_audio('song.mp3')
+    model.assert_not_called()

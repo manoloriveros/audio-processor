@@ -39,8 +39,10 @@ def _load_model(model_size_or_path, device, compute_type, cpu_threads, download_
                            "python local_transcription.py --download y comprueba dispositivo y memoria.") from exc
 
 
-def transcribe_local_audio(audio_path, *, chunk_seconds=120.0, overlap_seconds=2.0):
+def transcribe_local_audio(audio_path, *, chunk_seconds=None, overlap_seconds=2.0):
     """Consume each temporary chunk before it is released, then restore its times."""
+    if chunk_seconds is None:
+        chunk_seconds = float(os.getenv("LOCAL_WHISPER_CHUNK_SECONDS", "120"))
     settings = _settings()
     model = _load_model(**settings)
     model_name = f"faster-whisper/{settings['model_size_or_path']}/{settings['compute_type']}"
@@ -65,6 +67,8 @@ def transcribe_local_audio(audio_path, *, chunk_seconds=120.0, overlap_seconds=2
                         chunk.core_start, chunk.core_end)
     merged = merge_chunk_transcripts(results)
     merged["chunkCount"] = len(results)
+    merged["chunkSeconds"] = chunk_seconds
+    merged["overlapSeconds"] = overlap_seconds
     merged["duration"] = results[-1][0].core_end if results else 0.0
     return merged
 
