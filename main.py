@@ -285,6 +285,8 @@ def run_pipeline(audio_path: str) -> dict:
             vocals_path, instrumental_path, stems_dir = separation.separate(audio_path)
         try:
             lyrics_data = transcribe_with_whisper(vocals_path or audio_path)
+            from lyric_phrases import quarantine_credit_segments
+            lyrics_data = quarantine_credit_segments(lyrics_data)
             # Beats sobre el mix original (la bateria ayuda al beat-tracking);
             # armonia sobre el instrumental separado si existe.
             chords_data = detect_chords(instrumental_path or audio_path, beat_source=audio_path)
@@ -300,6 +302,7 @@ def run_pipeline(audio_path: str) -> dict:
                 result["analysisWarnings"] = [*result["analysisWarnings"], "No se pudieron detectar los acordes."]
             result["analysisDuration"] = lyrics_data.get("duration")
             result["transcriptionChunks"] = lyrics_data.get("chunkCount", 1)
+            result["transcriptionReviewSegments"] = lyrics_data.get("reviewSegments", [])
             result["engine"] = "self-hosted+stems" if vocals_path else "self-hosted"
             if structuring is not None:
                 if TRANSCRIPTION_ENGINE == "faster-whisper":
@@ -1407,7 +1410,10 @@ def _time_to_char_index(chord_time: float, line_text: str, line_start: float,
 def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
     """Build editor lines while retaining the original harmonic timeline."""
     from timeline import build_sections, normalize_events
-    segments = _split_long_segments(lyrics_data.get("segments", []), words=lyrics_data.get("words", []))
+    from lyric_phrases import repeated_phrase_segments
+    measured_words = lyrics_data.get("words", [])
+    phrases = repeated_phrase_segments(lyrics_data.get("segments", []), measured_words)
+    segments = _split_long_segments(phrases, words=measured_words)
     timeline = normalize_events(chords_data, duration=lyrics_data.get("duration"))
     sections = build_sections(segments, timeline)
     harmonic_events = [event for event in timeline if event["chord"] != "N"]

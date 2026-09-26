@@ -18,6 +18,7 @@ preserve_boundaries=True when sections already come from an acoustic model.
 from bisect import bisect_left
 from collections import defaultdict
 from copy import deepcopy
+from difflib import SequenceMatcher
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ SECTION_LABEL_MAP = {
     "pre-chorus": "Pre-coro", "prechorus": "Pre-coro", "pre chorus": "Pre-coro",
     "pre-coro": "Pre-coro", "precoro": "Pre-coro",
     "bridge": "Puente", "puente": "Puente", "intro": "Intro",
-    "outro": "Final", "ending": "Final", "coda": "Final", "final": "Final",
+    "outro": "Outro", "ending": "Final", "coda": "Final", "final": "Final",
     "instrumental": "Instrumental", "interlude": "Instrumental", "solo": "Instrumental",
 }
 
@@ -41,7 +42,7 @@ _SYSTEM_PROMPT = (
     "Puedes reagrupar lineas consecutivas en secciones y cambiar el numero de "
     "secciones. Conserva TODOS los IDs exactamente una vez y en el mismo orden, "
     "incluidas todas las repeticiones del coro y las lineas instrumentales vacias. "
-    "Nombres permitidos: Intro, Verso 1..N, Pre-coro, Coro, Puente, Instrumental, Final. "
+    "Nombres permitidos: Intro, Verso 1..N, Pre-coro, Coro, Puente, Instrumental, Outro, Final. "
     "No deduzcas un coro solo de una palabra repetida. Conserva las secciones "
     "instrumentales y los nombres semanticos ya asignados. Si preserve_boundaries "
     "es true conserva ademas todas las agrupaciones y nombres existentes. "
@@ -156,28 +157,107 @@ def _meaningful_refrain(block: tuple) -> bool:
     if len(tokens) < 6 or len(set(tokens)) < 4:
         return False
     # Prefer one complete repetition over an ABAB... concatenation of it.
-    for period in range(1, len(block) // 2 + 1):
-        if len(block) % period == 0 and block == block[:period] * (len(block) // period):
+    for period in range(1, (len(block) + 1) // 2 + 1):
+        if len(block) - period >= 2 and all(block[i] == block[i % period] for i in range(len(block))):
             return False
     return True
+
+
+def _similar_phrase(left, right, threshold=.82):
+    if not left or not right:
+        return False
+    if ({w for w in left if w.isdigit()} != {w for w in right if w.isdigit()}
+            or ("no" in left) != ("no" in right)):
+        return False
+    matcher = SequenceMatcher(None, left, right, autojunk=False)
+    shared = sum(block.size for block in matcher.get_matching_blocks())
+    fillers = {"y", "porque", "oh", "ah", "el", "la"}
+    connective_only = all(set(left[a:b]) | set(right[c:d]) <= fillers
+                          for tag, a, b, c, d in matcher.get_opcodes() if tag != "equal")
+    return shared >= 2 and (matcher.ratio() >= threshold or connective_only)
+
+
+def _pattern_ranges(keys, pattern):
+    """Recover complete learned refrains split differently by ASR.
+
+    Match all slots before accepting a range. Only a duplicated phrase may
+    be shortened, with at least two other distinct full phrases corroborating
+    the same block. Classification does not rewrite any lyric or line.
+    """
+    result, start = [], 0
+    duplicated = {phrase for phrase in pattern if pattern.count(phrase) > 1}
+    while start < len(keys):
+        def match(slot, cursor, strong):
+            if slot == len(pattern):
+                return cursor if len(strong) >= min(2, len(set(pattern))) else None
+            phrase = pattern[slot]
+            for count in range(1, 4):
+                parts = keys[cursor:cursor + count]
+                if len(parts) != count or not all(parts):
+                    break
+                if count > 1 and any(len(part) == 1 and part[0] not in {"porque", "y", "oh", "ah"} for part in parts):
+                    continue
+                combined = tuple(word for part in parts for word in part)
+                full = _similar_phrase(phrase, combined)
+                relaxed = (count == 1 and phrase in duplicated and len(combined) <= len(phrase)
+                           and _similar_phrase(phrase, combined, .65))
+                first_variant = (slot == 0 and len(pattern) >= 3 and len(set(phrase) & set(combined)) >= 3
+                                 and _similar_phrase(phrase, combined, .75))
+                if full or relaxed or first_variant:
+                    end = match(slot + 1, cursor + count, strong | ({phrase} if full else set()))
+                    if end is not None:
+                        return end
+            return None
+        end = match(0, start, set())
+        if end is None:
+            start += 1
+        else:
+            result.append((start, end))
+            start = end
+    return result
+
+
+def _phrase_keys(lines, sources, sections):
+    """Compare complete phrases with conservative ASR variations, never edit them."""
+    keys, representatives = [], []
+    fillers = {"y", "porque", "oh", "ah", "el", "la"}
+    for line, source in zip(lines, sources):
+        key = _words(line.get("lyrics", "")) if not _protected_section(sections[source]) else ()
+        representative = key
+        if len(key) >= 2:
+            for previous in representatives:
+                if len(previous) < 2 or abs(len(key) - len(previous)) > 2:
+                    continue
+                if ({w for w in key if w.isdigit()} != {w for w in previous if w.isdigit()}
+                        or ("no" in key) != ("no" in previous)):
+                    continue
+                matcher = SequenceMatcher(None, previous, key, autojunk=False)
+                shared = sum(block.size for block in matcher.get_matching_blocks())
+                connective_only = all(
+                    set(previous[a:b]) | set(key[c:d]) <= fillers
+                    for tag, a, b, c, d in matcher.get_opcodes() if tag != "equal")
+                if shared >= 2 and (matcher.ratio() >= .82 or connective_only):
+                    representative = previous
+                    break
+        if key and representative == key and key not in representatives:
+            representatives.append(key)
+        keys.append(representative)
+    return keys
 
 
 def infer_repeated_sections(sections: list[dict]) -> list[dict]:
     """Split generic verses around repeated blocks of complete lines.
 
-    Exact normalized word matches are deliberate. Single repeated phrases or
-    words, fuzzy matches, and a fixed every-four-lines rule are too speculative.
+    Complete repeated blocks establish the reference; conservative phrase
+    variations may recover ASR boundaries. A single repeated phrase cannot
+    establish a chorus by itself. No fixed line count or lyric repair is used.
     Existing verse boundaries survive outside an inferred refrain. Returns the
     input unchanged if there is no defensible new grouping.
     """
     if not sections or any(not section.get("lines") for section in sections):
         return sections
     lines, sources = _flatten(sections)
-    keys = [
-        _words(line.get("lyrics", ""))
-        if not _protected_section(sections[source]) else ()
-        for line, source in zip(lines, sources)
-    ]
+    keys = _phrase_keys(lines, sources, sections)
     candidates = []
     # Short indexed seeds avoid comparing every line pair. Extend matching
     # seeds below so a long refrain is not cut at an arbitrary line count.
@@ -211,6 +291,7 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
     candidates.sort(key=lambda item: (-item[0], -item[1], item[2][0]))
     occupied: set[int] = set()
     refrains: dict[int, tuple[int, bool]] = {}
+    families = []
     for _, length, starts, chorus_candidate in candidates:
         available = [
             start for start in starts
@@ -221,8 +302,99 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
         for start in available:
             refrains[start] = (start + length, chorus_candidate)
             occupied.update(range(start, start + length))
+        families.append((available, length, chorus_candidate))
     if not refrains:
         return sections
+
+    # The widest recurring complete family is the chorus reference. Secondary
+    # short verse fragments must not create additional chorus boundaries.
+    eligible = [family for family in families if family[2]]
+    dominant = max(eligible, key=lambda f: (f[0][-1] - f[0][0]) * f[1], default=None)
+    bridges, outros = {}, {}
+    if dominant:
+        starts, length, _ = dominant
+        pattern = tuple(keys[starts[0]:starts[0] + length])
+        core_ranges = _pattern_ranges(keys, pattern)
+        # Apply the dominant-family filter only with at least three complete
+        # occurrences. Two refrains alone cannot establish competing roles.
+        established = len(core_ranges) >= 3
+        if established:
+            refrains = {start: (end, True) for start, end in core_ranges}
+            for other_starts, other_length, candidate in families:
+                if not candidate:
+                    for start in other_starts:
+                        refrains.setdefault(start, (start + other_length, False))
+            # Recover a repeated opening verse with complete phrase evidence.
+            # Its final repetition may include additional lines before the chorus.
+            opening = next((i for i, key in enumerate(keys) if key), 0)
+            first_chorus = core_ranges[0][0]
+            for size in range(3, min(8, first_chorus - opening) + 1):
+                verse_pattern = tuple(keys[opening:opening + size])
+                if not all(verse_pattern) or len(set(verse_pattern)) < 3:
+                    continue
+                verse_ranges = _pattern_ranges(keys[:first_chorus], verse_pattern)
+                if (len(verse_ranges) == 2 and verse_ranges[0][0] == opening
+                        and verse_ranges[0][1] == verse_ranges[1][0]):
+                    first, second = verse_ranges
+                    refrains[first[0]] = (first[1], False)
+                    refrains[second[0]] = (first_chorus, False)
+                    break
+            # Attach a recurrent short closing phrase learned immediately after
+            # complete choruses; do not absorb arbitrary adjacent verse lyrics.
+            endings = defaultdict(list)
+            for start, end in core_ranges:
+                for count in (1, 2):
+                    parts = keys[end:end + count]
+                    phrase = tuple(word for part in parts for word in part)
+                    if (len(parts) != count or not all(parts) or not 2 <= len(phrase) <= 4
+                            or any(i in refrains for i in range(end, end + count))
+                            or any(_similar_phrase(phrase, core) for core in pattern)):
+                        continue
+                    gap = lines[end].get("_startTime", 0) - lines[end - 1].get("_endTime", 0)
+                    if gap <= 6:
+                        endings[phrase].append((start, end, count))
+            for phrase, occurrences in endings.items():
+                support = {start for other, spans in endings.items()
+                           if _similar_phrase(phrase, other, .8)
+                           for start, _, _ in spans}
+                if len(support) >= 2:
+                    for start, end, count in occurrences:
+                        refrains[start] = (max(refrains[start][0], end + count), True)
+            for other_starts, other_length, candidate in families:
+                if not candidate or len(other_starts) < 3 or other_starts == starts:
+                    continue
+                end = other_starts[-1] + other_length
+                compact = all(b - a <= other_length + 2 for a, b in zip(other_starts, other_starts[1:]))
+                surrounded = any(s < other_starts[0] for s, _ in core_ranges) and any(s >= end for s, _ in core_ranges)
+                if not compact or not surrounded or not all(keys[i] for i in range(other_starts[0], end)):
+                    continue
+                bridge_pattern = keys[other_starts[0]:other_starts[0] + other_length]
+                cursor = 0
+                while end < len(keys) and keys[end] and end not in refrains:
+                    expected = bridge_pattern[cursor % other_length]
+                    actual = keys[end]
+                    partial = len(actual) >= 1 and len(actual) < len(expected) and tuple(expected[:len(actual)]) == actual
+                    if actual != expected and not partial:
+                        break
+                    end += 1
+                    cursor += 1
+                bridges[other_starts[0]] = end
+            # A repeated chorus phrase after the last complete chorus may be an
+            # outro. Require three full repeats; retain intervening fragments.
+            last_start, _ = core_ranges[-1]
+            tail = refrains[last_start][0]
+            for phrase in set(pattern):
+                end, repeats = tail, 0
+                while end < len(keys) and keys[end]:
+                    actual = keys[end]
+                    if _similar_phrase(phrase, actual):
+                        repeats += 1
+                    elif not (len(actual) <= 3 and set(actual) <= set(phrase)):
+                        break
+                    end += 1
+                if repeats >= 3:
+                    outros[tail] = end
+                    break
 
     result, index, verse_number = [], 0, 0
     while index < len(lines):
@@ -230,12 +402,22 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
         original = sections[source]
         is_refrain = index in refrains
         end, chorus_candidate = refrains.get(index, (index + 1, False))
-        if not is_refrain:
-            while end < len(lines) and sources[end] == source and end not in refrains:
+        is_bridge = index in bridges
+        is_outro = index in outros
+        if is_outro:
+            end = outros[index]
+        elif is_bridge:
+            end = bridges[index]
+        elif not is_refrain:
+            while end < len(lines) and sources[end] == source and end not in refrains and end not in bridges and end not in outros:
                 end += 1
         section = {key: deepcopy(value) for key, value in original.items() if key != "lines"}
         section["lines"] = deepcopy(lines[index:end])
-        if is_refrain and chorus_candidate:
+        if is_outro:
+            section["name"] = "Outro"
+        elif is_bridge:
+            section["name"] = "Puente"
+        elif is_refrain and chorus_candidate:
             section["name"] = "Coro"
         elif _section_kind(original.get("name", "")) == "Verso":
             verse_number += 1

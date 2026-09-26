@@ -96,7 +96,7 @@ def split_segments(segments, words=(), max_len=40, min_len=15):
             continue
         tokens, mapped = word_positions(text, start, end, words)
         cuts = [0]
-        for index in range(1, len(tokens)):
+        for index in range(1, len(tokens)) if not segment.get("_repeated_phrase") else ():
             if index not in mapped or index - 1 not in mapped:
                 continue
             first = tokens[cuts[-1]].start()

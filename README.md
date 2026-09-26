@@ -267,3 +267,35 @@ Athenas no tiene anotación completa para medir precisión o exactitud temporal;
 las capturas son una referencia parcial. La prueba de asignación comprueba que
 ningún cambio detectado se pierde ni mueve al ensamblar, no que cada predicción
 sea musicalmente correcta. También quedan errores de versos/coros/puente.
+
+## Frases completas y estructura de canciones largas
+
+La sincronización aprende frases completas repetidas en la grabación cuando
+existen tiempos medidos para todas sus palabras. Puede reconstruir una frase
+partida por el transcriptor o separar un bloque que contiene varias frases.
+Las frases aprendidas no se vuelven a cortar por el límite visual de 40 caracteres.
+Los segmentos sin cobertura completa conservan el comportamiento anterior.
+No se añaden ni sustituyen palabras, ni se estiman tiempos nuevos.
+
+La agrupación local compara bloques completos y variaciones conservadoras de
+frases. Con al menos tres coros completos, una familia dominante ayuda a evitar
+que fragmentos repetidos de los versos se etiqueten como coros. Un patrón compacto
+repetido entre coros puede sugerir Puente, y tres repeticiones de una frase del
+coro después del último bloque completo pueden sugerir Outro. Son inferencias
+textuales: canciones con varias familias de coros, medleys o palabras muy
+parecidas todavía requieren revisión. No hay letras ni acordes de canciones
+concretas codificados en estas reglas.
+
+Los créditos explícitos de subtítulos o agradecimientos por ver un vídeo, cuando
+aparecen en los últimos 45 segundos y en el último 10% del audio, se apartan de la
+letra y se devuelven en `transcriptionReviewSegments`, con la advertencia
+`possible_asr_credits_quarantined`. Esto conserva el texto original para revisión;
+no demuestra que no se haya pronunciado. Un «Gracias» aislado no se elimina.
+El editor todavía no ofrece una pantalla específica para esos segmentos.
+
+La comparación del 26/09/2026 reusa las transcripciones locales y acordes ya
+obtenidos del MP3 completo de Athenas. La voz separada pasa de 29 a 16 secciones,
+con dos versos iniciales, cinco coros, un puente y un outro. Conserva las 239
+palabras retenidas, y todos los 118 intervalos musicales detectados con sus tiempos
+originales. No es una nueva medición de precisión del reconocimiento ni una
+prueba del servicio desplegado. Permanecen errores de palabras y límites de línea.
