@@ -10,6 +10,18 @@ import re
 from timeline import word_positions, _word_key
 
 
+def is_music_annotation(text):
+    """Recognize explicit non-lyric music markers, never ordinary sung words."""
+    clean = str(text or "").strip()
+    if clean.casefold() in {"[música]", "(música)", "[musica]", "(musica)",
+                           "[music]", "(music)", "[instrumental]", "(instrumental)"}:
+        return True
+    notes = {"♩", "♪", "♫", "♬", "𝄞", "𝄢"}
+    return bool(set(clean) & notes) and all(
+        character in notes or character.isspace() or character in ".,;:!?-–—()[]{}"
+        for character in clean)
+
+
 def repeated_phrase_segments(segments, words):
     if not words or len(segments) < 3:
         return segments

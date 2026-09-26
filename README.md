@@ -299,3 +299,18 @@ con dos versos iniciales, cinco coros, un puente y un outro. Conserva las 239
 palabras retenidas, y todos los 118 intervalos musicales detectados con sus tiempos
 originales. No es una nueva medición de precisión del reconocimiento ni una
 prueba del servicio desplegado. Permanecen errores de palabras y límites de línea.
+
+Los marcadores explícitos como ♪, ♫ y [Música] ya no se consideran palabras
+cantadas. Se excluyen de los segmentos de letra antes de ensamblar la cronología:
+el inicio queda como Intro, los interludios largos como Instrumental y un audio
+sin letra como Instrumental. Los eventos de acordes y sus tiempos se conservan.
+No se elimina «Música» sin corchetes, ni palabras breves o letras ambiguas como J.
+SongEditor aplica además esta normalización al importar respuestas antiguas:
+combina bloques instrumentales contiguos, distribuye hasta ocho acordes por fila
+sin símbolos de música y renumera solo los versos cantados.
+
+Una repetición más frecuente y separada puede servir de referencia antes que
+un bloque largo de verso repetido dos veces. Al reconstruir frases divididas,
+cada fragmento debe aportar palabras de la frase conocida: esto evita tomar una
+línea ajena del verso previo. Las variantes de un inicio doble del coro pueden
+reconocerse solo dentro de un patrón completo respaldado por otras frases.

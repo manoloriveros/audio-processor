@@ -198,6 +198,9 @@ def _pattern_ranges(keys, pattern):
                 if count > 1 and any(len(part) == 1 and part[0] not in {"porque", "y", "oh", "ah"} for part in parts):
                     continue
                 combined = tuple(word for part in parts for word in part)
+                if count > 1 and (len(combined) > len(phrase) + 2 or any(
+                        len(part) >= 2 and len(set(part) & set(phrase)) < 2 for part in parts)):
+                    continue
                 full = _similar_phrase(phrase, combined)
                 relaxed = (count == 1 and phrase in duplicated and len(combined) <= len(phrase)
                            and _similar_phrase(phrase, combined, .65))
@@ -288,7 +291,13 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
             ))
             if _meaningful_refrain(extended):
                 candidates.append((block_length * len(starts), block_length, starts, not adjacent_pair))
-    candidates.sort(key=lambda item: (-item[0], -item[1], item[2][0]))
+    # Repeated verse tails must not outrank a more widely recurring chorus.
+    # Compact adjacent cycles remain ambiguous (often a bridge).
+    def support(item):
+        _, length, starts, _ = item
+        return int(len(starts) >= 3 and starts[-1] - starts[0] > 2 * length
+                   and max(b - a for a, b in zip(starts, starts[1:])) >= length + 2)
+    candidates.sort(key=lambda item: (-support(item), -item[0], -item[1], item[2][0]))
     occupied: set[int] = set()
     refrains: dict[int, tuple[int, bool]] = {}
     families = []
@@ -314,6 +323,19 @@ def infer_repeated_sections(sections: list[dict]) -> list[dict]:
     if dominant:
         starts, length, _ = dominant
         pattern = tuple(keys[starts[0]:starts[0] + length])
+        # A widely repeated core may survive while its doubled opening phrase
+        # is shortened by ASR. Learn that prefix only when both complete nearby
+        # phrases agree; never borrow different verse lines before the core.
+        if starts[0] >= 2 and len(starts) >= 3 and (len(pattern) < 2 or pattern[0] != pattern[1]):
+            prefix = keys[starts[0] - 2:starts[0]]
+            if all(len(phrase) >= 3 for phrase in prefix) and _similar_phrase(prefix[0], prefix[1], .65):
+                opening_phrase = max(prefix, key=len)
+                pattern = (opening_phrase, opening_phrase, *pattern)
+        if (len(pattern) >= 4 and min(len(pattern[0]), len(pattern[1])) >= 3
+                and len(set(pattern[0]) & set(pattern[1])) >= 3
+                and _similar_phrase(pattern[0], pattern[1], .65)):
+            opening_phrase = max(pattern[:2], key=len)
+            pattern = (opening_phrase, opening_phrase, *pattern[2:])
         core_ranges = _pattern_ranges(keys, pattern)
         # Apply the dominant-family filter only with at least three complete
         # occurrences. Two refrains alone cannot establish competing roles.

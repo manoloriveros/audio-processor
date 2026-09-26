@@ -1410,9 +1410,11 @@ def _time_to_char_index(chord_time: float, line_text: str, line_start: float,
 def synchronize(lyrics_data: dict, chords_data: list[dict]) -> dict:
     """Build editor lines while retaining the original harmonic timeline."""
     from timeline import build_sections, normalize_events
-    from lyric_phrases import repeated_phrase_segments
+    from lyric_phrases import repeated_phrase_segments, is_music_annotation
     measured_words = lyrics_data.get("words", [])
-    phrases = repeated_phrase_segments(lyrics_data.get("segments", []), measured_words)
+    lyric_segments = [segment for segment in lyrics_data.get("segments", [])
+                      if not is_music_annotation(segment.get("text", ""))]
+    phrases = repeated_phrase_segments(lyric_segments, measured_words)
     segments = _split_long_segments(phrases, words=measured_words)
     timeline = normalize_events(chords_data, duration=lyrics_data.get("duration"))
     sections = build_sections(segments, timeline)
