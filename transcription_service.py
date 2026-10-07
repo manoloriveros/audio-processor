@@ -112,12 +112,12 @@ def transcribe_chunk(client, audio_path, *, timestamp_model, text_models, prompt
 
 
 def transcribe_audio(audio_path, *, api_key, timestamp_model, text_models, prompt,
-                     chunk_seconds=120.0, overlap_seconds=2.0):
+                     chunk_seconds=120.0, overlap_seconds=2.0, max_retries=1):
     import openai
 
     results = []
     # Client resources and each temporary WAV are released even on cancellation/error.
-    with openai.OpenAI(api_key=api_key, timeout=90, max_retries=1) as client:
+    with openai.OpenAI(api_key=api_key, timeout=90, max_retries=max_retries) as client:
         with iter_audio_chunks(audio_path, chunk_seconds=chunk_seconds,
                                overlap_seconds=overlap_seconds) as chunks:
             for chunk in chunks:
