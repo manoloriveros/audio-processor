@@ -10,6 +10,7 @@ import secrets as _secrets
 import shutil
 import tempfile
 import logging
+import math
 import re
 from difflib import SequenceMatcher
 
@@ -608,6 +609,11 @@ async def health():
         "youtubeCookies": bool(os.getenv("YTDLP_COOKIES_B64")),
         "llmStructure": bool(TRANSCRIPTION_ENGINE != "faster-whisper" and OPENAI_API_KEY and os.getenv("LLM_STRUCTURE", "0") != "0"),
         "musicai": bool(TRANSCRIPTION_ENGINE != "faster-whisper" and musicai_engine and musicai_engine.is_configured()),
+        "markerTranscription": {"configured": bool(API_SECRET and (
+                                    TRANSCRIPTION_ENGINE == "faster-whisper" or
+                                    (TRANSCRIPTION_ENGINE == "openai" and OPENAI_API_KEY))),
+                                "analysisVersion": "auto-markers-v1",
+                                "maximumDuration": min(YT_MAX_DURATION, 720)},
     }
 
 
@@ -670,6 +676,120 @@ async def process_audio(
 
 class ProcessUrlBody(BaseModel):
     url: str
+
+
+def _marker_error(status: int, code: str, message: str) -> HTTPException:
+    return HTTPException(status_code=status, detail={"code": code, "message": message})
+
+
+def _download_marker_youtube_audio(video_id: str, workdir: str) -> str:
+    from marker_download import download_marker_audio, MarkerDownloadError
+    try:
+        return download_marker_audio(video_id, workdir, min(YT_MAX_DURATION, 720))
+    except MarkerDownloadError as exc:
+        raise _marker_error(exc.status, exc.code, exc.message) from exc
+
+
+def _transcribe_marker_recording(audio_path: str, video_id: str) -> dict:
+    """Only measured word times; no stems, chords, text correction or editorial API."""
+    from transcription_chunks import probe_audio_duration
+
+    try:
+        duration = float(probe_audio_duration(audio_path, timeout_seconds=30))
+    except Exception as exc:
+        raise _marker_error(422, "INVALID_AUDIO", "No se pudo medir la duracion del audio") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise _marker_error(422, "INVALID_AUDIO", "La duracion del audio no es valida")
+    if duration > min(YT_MAX_DURATION, 720):
+        raise _marker_error(400, "DURATION_LIMIT", "El audio supera el limite de 12 minutos")
+
+    try:
+        if TRANSCRIPTION_ENGINE == "faster-whisper":
+            from local_transcription import transcribe_local_audio
+            result = transcribe_local_audio(audio_path)
+        else:
+            from transcription_service import transcribe_audio
+            result = transcribe_audio(
+                audio_path, api_key=OPENAI_API_KEY, timestamp_model="whisper-1",
+                text_models=[], prompt=None, max_retries=0,
+            )
+    except Exception as exc:
+        # A request may have billed earlier chunks. Do not signal a safe automatic retry.
+        logger.warning("Transcripcion de marcadores fallida para %s: %s", video_id, type(exc).__name__)
+        raise _marker_error(422, "TRANSCRIPTION_FAILED", "No se pudo completar la transcripcion temporal") from exc
+
+    if not isinstance(result, dict):
+        raise _marker_error(422, "TRANSCRIPTION_FAILED", "La transcripcion temporal no produjo un resultado valido")
+    words = []
+    for item in result.get("words") or []:
+        if not isinstance(item, dict) or item.get("timing_estimated"):
+            continue
+        if isinstance(item.get("start"), bool) or isinstance(item.get("end"), bool):
+            continue
+        text = str(item.get("word") or "").strip()
+        try:
+            start, end = float(item["start"]), float(item["end"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if text and math.isfinite(start) and math.isfinite(end) and 0 <= start < end <= duration:
+            words.append({"word": text, "start": start, "end": end})
+    if not words:
+        raise _marker_error(422, "NO_MEASURED_WORDS", "No se obtuvieron palabras con tiempos medidos")
+    words.sort(key=lambda word: (word["start"], word["end"]))
+    return {"videoId": video_id, "duration": duration, "words": words,
+            "model": result.get("model"), "analysisVersion": "auto-markers-v1"}
+
+
+async def _await_marker_thread(function, *args):
+    """Keep the slot and files alive if the HTTP caller disconnects during inference."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            pass
+        raise
+
+
+@app.post("/transcribe-url")
+async def transcribe_url(
+    body: ProcessUrlBody,
+    x_api_secret: str = Header(None),
+):
+    """Lightweight timing-only analysis for saved lyrics linked to this YouTube video."""
+    if not API_SECRET:
+        raise _marker_error(503, "CONFIGURATION", "Servicio no configurado")
+    if not x_api_secret or not _secrets.compare_digest(x_api_secret, API_SECRET):
+        raise _marker_error(401, "UNAUTHORIZED", "No autorizado")
+    if TRANSCRIPTION_ENGINE not in {"openai", "faster-whisper"}:
+        raise _marker_error(503, "CONFIGURATION", "Motor de transcripcion no configurado")
+    if TRANSCRIPTION_ENGINE == "openai" and not OPENAI_API_KEY:
+        raise _marker_error(503, "CONFIGURATION", "OPENAI_API_KEY no configurada")
+    video_id = _extract_youtube_id(body.url)
+    if not video_id:
+        raise _marker_error(400, "INVALID_SOURCE", "URL de YouTube no valida")
+
+    # Download and inference share the worker slot, including temporary file lifetime.
+    async with _JOB_SEMAPHORE:
+        workdir = tempfile.mkdtemp(prefix="yt_markers_")
+        try:
+            try:
+                audio_path = await _await_marker_thread(_download_marker_youtube_audio, video_id, workdir)
+            except HTTPException as exc:
+                if isinstance(exc.detail, dict) and exc.detail.get("code"):
+                    raise
+                code = "VIDEO_UNAVAILABLE"
+                if exc.status_code == 400:
+                    code = "DURATION_LIMIT" if "maximo" in str(exc.detail).lower() else "INVALID_AUDIO"
+                raise _marker_error(exc.status_code, code, str(exc.detail)) from exc
+            except Exception as exc:
+                raise _marker_error(502, "VIDEO_UNAVAILABLE", "No se pudo descargar el audio del video") from exc
+            recording = await _await_marker_thread(_transcribe_marker_recording, audio_path, video_id)
+            return {"recording": recording}
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 class ResolveSpotifyBody(ProcessUrlBody):
