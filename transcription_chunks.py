@@ -20,6 +20,13 @@ import wave
 
 
 MAX_CHUNK_BYTES = 24_000_000
+LOCAL_AUDIO_FORMATS = "mov,mp3,wav,ogg,matroska,flac,aac,mpeg,mpegts"
+
+
+def _input_security_args(local_only: bool) -> list[str]:
+    # Uploaded bytes may be playlists despite their filename/content-type. Both
+    # probing and decoding must refuse remote protocols and playlist demuxers.
+    return ["-protocol_whitelist", "file", "-format_whitelist", LOCAL_AUDIO_FORMATS] if local_only else []
 
 
 @dataclass(frozen=True)
@@ -71,7 +78,7 @@ def _run(args: list[str], timeout_seconds: float) -> str:
 
 
 def probe_audio_duration(
-    audio_path: str, *, ffprobe: str = "ffprobe", timeout_seconds: float = 60.0,
+    audio_path: str, *, ffprobe: str = "ffprobe", timeout_seconds: float = 60.0, local_only: bool = False,
 ) -> float:
     """Read duration and verify an audio stream without decoding PCM into memory."""
     source = Path(audio_path).resolve(strict=True)
@@ -79,7 +86,7 @@ def probe_audio_duration(
         raise ValueError("Audio input must be a file")
     timeout_seconds = _positive(timeout_seconds, "timeout_seconds")
     raw = _run([
-        ffprobe, "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+        ffprobe, "-v", "error", *_input_security_args(local_only), "-show_entries", "format=duration:stream=codec_type",
         "-of", "json", str(source),
     ], timeout_seconds)
     try:
@@ -111,7 +118,7 @@ def _verify_wav(path: Path, expected_duration: float, sample_rate: int) -> None:
 def iter_audio_chunks(
     audio_path: str, *, chunk_seconds: float = 120.0, overlap_seconds: float = 2.0,
     ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", timeout_seconds: float = 180.0,
-    temp_dir: str | None = None, sample_rate: int = 16000,
+    temp_dir: str | None = None, sample_rate: int = 16000, local_only: bool = False,
 ) -> Iterator[Iterator[AudioChunk]]:
     """Yield a lazy iterator of normalized WAVs, keeping just one chunk on disk.
 
@@ -133,7 +140,8 @@ def iter_audio_chunks(
     if (chunk_seconds + 2 * overlap_seconds) * sample_rate * 2 + 4096 >= MAX_CHUNK_BYTES:
         raise ValueError("Chunk duration and sample rate exceed the PCM upload size budget")
     source = Path(audio_path).resolve(strict=True)
-    duration = probe_audio_duration(str(source), ffprobe=ffprobe, timeout_seconds=timeout_seconds)
+    duration = probe_audio_duration(str(source), ffprobe=ffprobe, timeout_seconds=timeout_seconds,
+                                    **({"local_only": True} if local_only else {}))
     with TemporaryDirectory(prefix="song-transcription-", dir=temp_dir) as directory:
         def generate() -> Iterator[AudioChunk]:
             for index in range(math.ceil(duration / chunk_seconds)):
@@ -146,6 +154,7 @@ def iter_audio_chunks(
                 try:
                     _run([
                         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                        *_input_security_args(local_only),
                         "-ss", f"{start:.9f}", "-i", str(source), "-t", f"{chunk.duration:.9f}",
                         "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(sample_rate),
                         "-c:a", "pcm_s16le", "-f", "wav", str(path),

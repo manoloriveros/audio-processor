@@ -767,12 +767,13 @@ def _download_marker_youtube_audio(video_id: str, workdir: str) -> str:
         raise _marker_error(exc.status, exc.code, exc.message) from exc
 
 
-def _transcribe_marker_recording(audio_path: str, video_id: str) -> dict:
+def _transcribe_marker_recording(audio_path: str, video_id: str, local_only: bool = False) -> dict:
     """Only measured word times; no stems, chords, text correction or editorial API."""
     from transcription_chunks import probe_audio_duration
 
     try:
-        duration = float(probe_audio_duration(audio_path, timeout_seconds=30))
+        duration = float(probe_audio_duration(audio_path, timeout_seconds=30,
+                                             **({"local_only": True} if local_only else {})))
     except Exception as exc:
         raise _marker_error(422, "INVALID_AUDIO", "No se pudo medir la duracion del audio") from exc
     if not math.isfinite(duration) or duration <= 0:
@@ -783,12 +784,13 @@ def _transcribe_marker_recording(audio_path: str, video_id: str) -> dict:
     try:
         if TRANSCRIPTION_ENGINE == "faster-whisper":
             from local_transcription import transcribe_local_audio
-            result = transcribe_local_audio(audio_path)
+            result = transcribe_local_audio(audio_path, **({"local_only": True} if local_only else {}))
         else:
             from transcription_service import transcribe_audio
             result = transcribe_audio(
                 audio_path, api_key=OPENAI_API_KEY, timestamp_model="whisper-1",
                 text_models=[], prompt=None, max_retries=0,
+                **({"local_only": True} if local_only else {}),
             )
     except Exception as exc:
         # A request may have billed earlier chunks. Do not signal a safe automatic retry.
@@ -919,7 +921,7 @@ async def transcribe_file(
                 await file.close()
             except Exception as exc:
                 raise _marker_error(400, "INVALID_AUDIO", "No se pudo cerrar el archivo recibido") from exc
-            recording = await _await_marker_thread(_transcribe_marker_recording, audio_path, video_id)
+            recording = await _await_marker_thread(_transcribe_marker_recording, audio_path, video_id, True)
             return {"recording": recording}
     finally:
         try:

@@ -134,6 +134,36 @@ class ChunkPreparationTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["timeout"], 3)
             self.assertNotIn("shell", run.call_args.kwargs)
 
+    def test_local_input_flags_apply_to_probe_and_every_decoder_only_when_requested(self):
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "recording.audio"
+            source.write_bytes(b"local fixture")
+            metadata = json.dumps({"format": {"duration": "2"}, "streams": [{"codec_type": "audio"}]})
+            with patch("transcription_chunks._run", return_value=metadata) as run:
+                self.assertEqual(probe_audio_duration(str(source), local_only=True), 2)
+                args = run.call_args.args[0]
+                self.assertEqual(args[args.index("-protocol_whitelist") + 1], "file")
+                formats = args[args.index("-format_whitelist") + 1].split(",")
+                self.assertNotIn("hls", formats)
+                self.assertNotIn("concat", formats)
+                self.assertNotIn("dash", formats)
+                probe_audio_duration(str(source))
+                self.assertNotIn("-protocol_whitelist", run.call_args.args[0])
+            calls = []
+            def decode(args, timeout):
+                calls.append(args)
+                Path(args[-1]).write_bytes(b"temporary")
+                return ""
+            with patch("transcription_chunks.probe_audio_duration", return_value=2) as probe, \
+                 patch("transcription_chunks._run", side_effect=decode), patch("transcription_chunks._verify_wav"):
+                with iter_audio_chunks(str(source), chunk_seconds=1, overlap_seconds=.1, local_only=True) as chunks:
+                    list(chunks)
+                self.assertTrue(probe.call_args.kwargs["local_only"])
+            self.assertEqual(len(calls), 2)
+            for args in calls:
+                self.assertLess(args.index("-protocol_whitelist"), args.index("-i"))
+                self.assertEqual(args[args.index("-protocol_whitelist") + 1], "file")
+
     @unittest.skipUnless(FFMPEG, "ffmpeg optional integration check")
     def test_real_ffmpeg_normalizes_short_audio_and_chunks_timeline(self):
         with TemporaryDirectory() as directory:

@@ -65,6 +65,10 @@ segundos y se mide con FFprobe antes de llamar al modelo. El archivo admite hast
 25 MiB. El endpoint de archivo limita también el cuerpo multipart, con hasta
 64 KiB adicionales para sus campos y encabezados, antes de analizar el formulario.
 Las lecturas son de hasta 1 MiB y los archivos temporales se eliminan al terminar.
+Los archivos subidos se prueban y decodifican con una lista de contenedores de
+audio autocontenidos y únicamente el protocolo local `file`. Un texto HLS, DASH
+o concat no se acepta aunque tenga extensión de audio; la lectura no abre sus
+referencias de red. Esta restricción se mantiene en cada ventana de FFmpeg.
 Una cancelación durante la inferencia conserva el archivo y la ranura de trabajo
 hasta que termine el hilo que lo está usando.
 
