@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from marker_download import (
     DOWNLOAD_TIMEOUT_SECONDS, MAX_DOWNLOAD_BYTES, MarkerDownloadError,
+    SOURCE_ERROR_MESSAGES, _classify_source_error, _source_error_code,
     _download_in_child, _validate_metadata, download_marker_audio,
 )
 
@@ -110,6 +111,63 @@ class MarkerDownloadTests(unittest.TestCase):
         self.ydl.extract_info.side_effect = RuntimeError("proxy user:secret or cookies")
         failure = self.assert_error("VIDEO_UNAVAILABLE", self.child)
         self.assertNotIn("secret", str(failure))
+
+    def test_source_error_classification_is_static_and_safe(self):
+        cases = [
+            ("Sign in to confirm you’re not a bot", "YOUTUBE_ACCESS_RESTRICTED"),
+            ("Sign in to confirm your age", "YOUTUBE_ACCESS_RESTRICTED"),
+            ("This video is private", "YOUTUBE_ACCESS_RESTRICTED"),
+            ("Please log in to watch this video", "YOUTUBE_ACCESS_RESTRICTED"),
+            ("This video is not available in your country", "YOUTUBE_ACCESS_RESTRICTED"),
+            ("Join this channel for members-only content", "YOUTUBE_ACCESS_RESTRICTED"),
+            ("Requested format is not available. Use --list-formats", "NO_AUDIO_FORMAT"),
+            ("Only images are available for download", "NO_AUDIO_FORMAT"),
+            ("No supported JavaScript runtime could be found", "JS_RUNTIME_UNAVAILABLE"),
+            ("yt-dlp-ejs is not installed", "JS_RUNTIME_UNAVAILABLE"),
+            ("Remote components challenge solver script (deno) were skipped", "JS_RUNTIME_UNAVAILABLE"),
+            ("HTTP Error 503: Service Unavailable", "VIDEO_UNAVAILABLE"),
+            ("connection timed out", "VIDEO_UNAVAILABLE"),
+        ]
+        for message, code in cases:
+            with self.subTest(message=message):
+                self.assertEqual(_source_error_code(message), code)
+                raw = RuntimeError(message + " https://user:secret-password@proxy.invalid/video?token=private-token")
+                failure = _classify_source_error(raw)
+                self.assertEqual(failure.code, code)
+                self.assertEqual(failure.status, 502)
+                self.assertEqual(failure.message, SOURCE_ERROR_MESSAGES[code])
+                self.assertNotIn("secret-password", str(failure))
+                self.assertNotIn("private-token", str(failure))
+
+    def test_child_preserves_source_code_without_raw_provider_text(self):
+        self.ydl.extract_info.side_effect = RuntimeError(
+            "Sign in to confirm you're not a bot https://user:secret-password@proxy.invalid")
+        failure = self.assert_error("YOUTUBE_ACCESS_RESTRICTED", self.child)
+        self.assertNotIn("secret-password", str(failure))
+        self.assertEqual(self.ydl.extract_info.call_count, 1)
+
+    def test_runtime_warning_explains_missing_formats_without_leaking_warning(self):
+        def fail(url, download):
+            self.options["logger"].warning("No supported JavaScript runtime could be found; proxy secret-password")
+            raise RuntimeError("Requested format is not available")
+        self.ydl.extract_info.side_effect = fail
+        self.assert_error("JS_RUNTIME_UNAVAILABLE", self.child)
+        self.assertFalse(self.options["no_warnings"])
+        failure = _classify_source_error(RuntimeError("Sign in to confirm you're not a bot"), {"JS_RUNTIME_UNAVAILABLE"})
+        self.assertEqual(failure.code, "YOUTUBE_ACCESS_RESTRICTED")
+
+    def test_parent_source_payload_preserves_whitelisted_code_and_discards_message(self):
+        for code, expected in SOURCE_ERROR_MESSAGES.items():
+            with self.subTest(code=code), patch("marker_download.subprocess.run", return_value=SimpleNamespace(
+                returncode=1, stdout=json.dumps({"code": code, "message": "secret-password https://user:pass@proxy.invalid"}))):
+                failure = self.assert_error(code, lambda: download_marker_audio("dQw4w9WgXcQ", self.workdir, 720))
+                self.assertEqual(failure.status, 502)
+                self.assertEqual(failure.message, expected)
+        for untrusted in ["HTTP403-secret-password", {"message": "secret-password"}]:
+            with patch("marker_download.subprocess.run", return_value=SimpleNamespace(
+                returncode=1, stdout=json.dumps({"code": untrusted, "message": "secret-password"}))):
+                failure = self.assert_error("VIDEO_UNAVAILABLE", lambda: download_marker_audio("dQw4w9WgXcQ", self.workdir, 720))
+                self.assertNotIn("secret-password", str(failure))
 
     def test_parent_enforces_hard_process_timeout_and_no_shell(self):
         with patch("marker_download.subprocess.run", side_effect=subprocess.TimeoutExpired(["test"], 180)) as run:

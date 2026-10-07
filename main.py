@@ -12,11 +12,12 @@ import tempfile
 import logging
 import math
 import re
+import json
 from difflib import SequenceMatcher
 
 import numpy as np
 import requests
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -682,11 +683,87 @@ def _marker_error(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail={"code": code, "message": message})
 
 
+_MARKER_FILE_MAX_BYTES = 25 * 1024 * 1024
+_MARKER_BODY_MAX_BYTES = _MARKER_FILE_MAX_BYTES + 64 * 1024
+_MARKER_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _marker_upload_response(send, status, code, message):
+    content = json.dumps({"detail": {"code": code, "message": message}}).encode("utf-8")
+    await send({"type": "http.response.start", "status": status, "headers": [
+        (b"content-type", b"application/json"), (b"content-length", str(len(content)).encode("ascii"))]})
+    await send({"type": "http.response.body", "body": content})
+
+
+class MarkerUploadLimitMiddleware:
+    """Authenticate and bound multipart bytes before FastAPI parses/spools them.
+
+    An over-limit streaming body never reaches the multipart parser. Bodies are
+    spooled to disk above one MiB and replayed in bounded chunks, not held in RAM.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("path") != "/transcribe-file" or scope.get("method") != "POST":
+            return await self.app(scope, receive, send)
+        headers = dict(scope.get("headers") or [])
+        if not API_SECRET:
+            return await _marker_upload_response(send, 503, "CONFIGURATION", "Servicio no configurado")
+        try:
+            authenticated = _secrets.compare_digest(headers.get(b"x-api-secret", b""), API_SECRET.encode("utf-8"))
+        except (TypeError, UnicodeError):
+            authenticated = False
+        if not authenticated:
+            return await _marker_upload_response(send, 401, "UNAUTHORIZED", "No autorizado")
+        if b"content-length" in headers:
+            try:
+                declared_size = int(headers[b"content-length"])
+            except (TypeError, ValueError, OverflowError):
+                declared_size = -1
+            if declared_size < 0:
+                return await _marker_upload_response(send, 400, "INVALID_AUDIO", "El tamaño del cuerpo no es válido")
+            if declared_size > _MARKER_BODY_MAX_BYTES:
+                return await _marker_upload_response(send, 413, "INVALID_AUDIO", "El archivo excede el límite de 25 MB")
+        with tempfile.SpooledTemporaryFile(max_size=_MARKER_UPLOAD_CHUNK_BYTES, mode="w+b") as body:
+            total = 0
+            while True:
+                event = await receive()
+                if event["type"] == "http.disconnect":
+                    return
+                data = event.get("body", b"")
+                total += len(data)
+                if total > _MARKER_BODY_MAX_BYTES:
+                    return await _marker_upload_response(send, 413, "INVALID_AUDIO", "El archivo excede el límite de 25 MB")
+                body.write(data)
+                if not event.get("more_body", False):
+                    break
+            body.seek(0)
+            remaining = total
+
+            async def replay():
+                nonlocal remaining
+                if body.closed:
+                    return await receive()
+                data = body.read(_MARKER_UPLOAD_CHUNK_BYTES)
+                remaining -= len(data)
+                if not remaining:
+                    body.close()  # Release the pre-parser spool before inference.
+                return {"type": "http.request", "body": data, "more_body": bool(remaining)}
+
+            return await self.app(scope, replay, send)
+
+
+app.add_middleware(MarkerUploadLimitMiddleware)
+
+
 def _download_marker_youtube_audio(video_id: str, workdir: str) -> str:
     from marker_download import download_marker_audio, MarkerDownloadError
     try:
         return download_marker_audio(video_id, workdir, min(YT_MAX_DURATION, 720))
     except MarkerDownloadError as exc:
+        logger.warning("Descarga de marcadores fallida: videoId=%s code=%s type=%s",
+                       video_id, exc.code, type(exc).__name__)
         raise _marker_error(exc.status, exc.code, exc.message) from exc
 
 
@@ -783,13 +860,75 @@ async def transcribe_url(
                 code = "VIDEO_UNAVAILABLE"
                 if exc.status_code == 400:
                     code = "DURATION_LIMIT" if "maximo" in str(exc.detail).lower() else "INVALID_AUDIO"
-                raise _marker_error(exc.status_code, code, str(exc.detail)) from exc
+                logger.warning("Descarga de marcadores fallida: videoId=%s code=%s type=%s",
+                               video_id, code, type(exc).__name__)
+                raise _marker_error(exc.status_code, code, "No se pudo obtener un audio válido de esta grabación") from exc
             except Exception as exc:
+                logger.warning("Descarga de marcadores fallida: videoId=%s code=VIDEO_UNAVAILABLE type=%s",
+                               video_id, type(exc).__name__)
                 raise _marker_error(502, "VIDEO_UNAVAILABLE", "No se pudo descargar el audio del video") from exc
             recording = await _await_marker_thread(_transcribe_marker_recording, audio_path, video_id)
             return {"recording": recording}
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/transcribe-file")
+async def transcribe_file(
+    file: UploadFile = File(...),
+    video_id: str = Form(...),
+    x_api_secret: str = Header(None),
+):
+    """Timing-only transcription of a private upload linked by the trusted backend.
+
+    A caller-supplied video id is context, not proof that the bytes are YouTube's
+    recording. The backend must keep this transcript in its private file cache.
+    """
+    workdir = None
+    try:
+        if not API_SECRET:
+            raise _marker_error(503, "CONFIGURATION", "Servicio no configurado")
+        if not x_api_secret or not _secrets.compare_digest(x_api_secret.encode("utf-8"), API_SECRET.encode("utf-8")):
+            raise _marker_error(401, "UNAUTHORIZED", "No autorizado")
+        if not isinstance(video_id, str) or not _YT_ID_RE.fullmatch(video_id):
+            raise _marker_error(400, "INVALID_SOURCE", "Identificador de YouTube no válido")
+        if TRANSCRIPTION_ENGINE not in {"openai", "faster-whisper"} or (
+            TRANSCRIPTION_ENGINE == "openai" and not OPENAI_API_KEY
+        ):
+            raise _marker_error(503, "CONFIGURATION", "Motor de transcripción no configurado")
+        async with _JOB_SEMAPHORE:
+            workdir = tempfile.mkdtemp(prefix="file_markers_")
+            audio_path = os.path.join(workdir, "recording.audio")
+            total = 0
+            try:
+                with open(audio_path, "wb") as target:
+                    while content := await file.read(_MARKER_UPLOAD_CHUNK_BYTES):
+                        total += len(content)
+                        if total > _MARKER_FILE_MAX_BYTES:
+                            raise _marker_error(413, "INVALID_AUDIO", "El archivo excede el límite de 25 MB")
+                        target.write(content)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Archivo de marcadores fallido: videoId=%s code=INVALID_AUDIO type=%s",
+                               video_id, type(exc).__name__)
+                raise _marker_error(400, "INVALID_AUDIO", "No se pudo leer el archivo de audio") from exc
+            if not total:
+                raise _marker_error(400, "INVALID_AUDIO", "El archivo de audio está vacío")
+            try:
+                await file.close()
+            except Exception as exc:
+                raise _marker_error(400, "INVALID_AUDIO", "No se pudo cerrar el archivo recibido") from exc
+            recording = await _await_marker_thread(_transcribe_marker_recording, audio_path, video_id)
+            return {"recording": recording}
+    finally:
+        try:
+            await file.close()
+        except Exception as exc:
+            logger.warning("Limpieza de archivo de marcadores: code=INVALID_AUDIO type=%s", type(exc).__name__)
+        finally:
+            if workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
 
 
 class ResolveSpotifyBody(ProcessUrlBody):

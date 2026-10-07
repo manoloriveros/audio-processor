@@ -7,6 +7,7 @@ is mocked and no real audio or OpenAI request is used.
 import ast
 import asyncio
 from contextlib import contextmanager
+import json
 import logging
 import math
 import os
@@ -44,7 +45,7 @@ def _load_functions(filename, names, namespace):
     path = Path(__file__).with_name(filename)
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     selected = [node for node in tree.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names]
     assert {node.name for node in selected} == set(names)
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
@@ -61,13 +62,14 @@ def _marker_namespace():
         "_YT_ID_RE": re.compile(r"^[a-zA-Z0-9_-]{11}$"),
         "logger": logging.getLogger("test-markers"), "_JOB_SEMAPHORE": asyncio.Semaphore(1),
     }
-    return _load_functions("main.py", ["_extract_youtube_id", "_marker_error",
+    return _load_functions("main.py", ["_extract_youtube_id", "_marker_error", "_download_marker_youtube_audio",
         "_transcribe_marker_recording", "_await_marker_thread", "transcribe_url"], namespace)
 
 
 class MarkerEndpointTests(unittest.TestCase):
     def setUp(self):
         self.ns = _marker_namespace()
+        self.real_download = self.ns["_download_marker_youtube_audio"]
         self.transcribe = Mock(return_value={"words": [
             {"word": "Alabar", "start": 4, "end": 4.8},
             {"word": "Dios", "start": 8, "end": 8.8}], "model": "whisper-1"})
@@ -198,6 +200,34 @@ class MarkerEndpointTests(unittest.TestCase):
     def test_bounded_downloader_validation_error_is_preserved(self):
         self.download.side_effect = HttpError(400, {"code": "INVALID_AUDIO", "message": "Live stream rejected"})
         self.assertEqual(self.error("INVALID_AUDIO", self.request).status_code, 400)
+        self.transcribe.assert_not_called()
+
+    def test_source_errors_have_safe_logs_and_never_start_transcription(self):
+        self.ns["_download_marker_youtube_audio"] = self.real_download
+        for code in ["YOUTUBE_ACCESS_RESTRICTED", "NO_AUDIO_FORMAT", "JS_RUNTIME_UNAVAILABLE"]:
+            with self.subTest(code=code), patch("marker_download.subprocess.run", return_value=SimpleNamespace(
+                returncode=1, stdout=json.dumps({"code": code, "message": "secret-password https://user:pass@proxy.invalid"}))):
+                with self.assertLogs("test-markers", level="WARNING") as observed:
+                    failure = self.error(code, self.request)
+                self.assertEqual(failure.status_code, 502)
+                rendered = " ".join(observed.output) + str(failure.detail)
+                self.assertIn("dQw4w9WgXcQ", rendered)
+                self.assertIn(code, rendered)
+                self.assertIn("MarkerDownloadError", rendered)
+                self.assertNotIn("secret-password", rendered)
+                self.assertNotIn("proxy.invalid", rendered)
+        self.transcribe.assert_not_called()
+        self.local.assert_not_called()
+        self.probe.assert_not_called()
+
+    def test_unexpected_download_exception_is_not_logged_or_returned_raw(self):
+        self.download.side_effect = RuntimeError("secret-password https://user:pass@proxy.invalid")
+        with self.assertLogs("test-markers", level="WARNING") as observed:
+            failure = self.error("VIDEO_UNAVAILABLE", self.request)
+        rendered = " ".join(observed.output) + str(failure.detail)
+        self.assertIn("RuntimeError", rendered)
+        self.assertNotIn("secret-password", rendered)
+        self.assertNotIn("proxy.invalid", rendered)
         self.transcribe.assert_not_called()
 
     def test_semaphore_covers_download_and_transcription(self):

@@ -46,6 +46,46 @@ Ese texto podía introducir palabras ausentes durante pasajes instrumentales. La
 coincidencia observada en la captura motivó retirarlo; no es una prueba causal A/B
 contra la API desplegada.
 
+## Marcadores de canciones guardadas
+
+Estos endpoints hacen únicamente una transcripción temporal. No separan voces ni
+calculan acordes; tampoco hacen una segunda pasada textual. OpenAI usa `whisper-1` con
+tiempos medidos por palabra, `text_models=[]` y `max_retries=0`. Ambos devuelven
+`{recording: {videoId, duration, words, model, analysisVersion}}`, con
+`analysisVersion=auto-markers-v1`.
+
+- `POST /transcribe-url`: cuerpo JSON con `url`, un enlace de YouTube válido.
+- `POST /transcribe-file`: formulario multipart con `file` y `video_id` obligatorio
+  (el identificador de 11 caracteres de la grabación vinculada a la canción).
+
+Ambos requieren el encabezado privado `x-api-secret`, igual a `API_SECRET` del
+procesador. La aplicación envía este encabezado desde su backend; no se entrega
+el secreto al navegador. El máximo de duración es `min(YT_MAX_DURATION, 720)`
+segundos y se mide con FFprobe antes de llamar al modelo. El archivo admite hasta
+25 MiB. El endpoint de archivo limita también el cuerpo multipart, con hasta
+64 KiB adicionales para sus campos y encabezados, antes de analizar el formulario.
+Las lecturas son de hasta 1 MiB y los archivos temporales se eliminan al terminar.
+Una cancelación durante la inferencia conserva el archivo y la ranura de trabajo
+hasta que termine el hilo que lo está usando.
+
+El identificador de un archivo subido es contexto, no una certificación de que
+sus bytes provienen de YouTube. El backend debe comprobarlo contra el enlace
+guardado y conservar esa transcripción en una caché privada de canción y hash;
+no debe incorporarla a la caché compartida de transcripciones de YouTube.
+
+Las descargas distinguen `YOUTUBE_ACCESS_RESTRICTED`, `NO_AUDIO_FORMAT` y
+`JS_RUNTIME_UNAVAILABLE` mediante mensajes controlados. Estos códigos de fuente
+devuelven HTTP 502 y ocurren antes de la transcripción. `VIDEO_UNAVAILABLE` cubre
+otros fallos de descarga. El registro guarda solo el identificador, el código y
+el tipo del fallo, sin texto del proveedor, URL firmada ni credenciales de proxy.
+`INVALID_AUDIO` y `DURATION_LIMIT` rechazan medios no válidos o demasiado largos;
+un archivo o cuerpo demasiado grande recibe HTTP 413 con `INVALID_AUDIO`.
+
+`TRANSCRIPTION_FAILED`, `NO_MEASURED_WORDS` y los resultados inciertos tras perder
+la respuesta requieren revisión. No se debe emitir otra llamada pagada de forma
+automática porque la anterior podría haberse cobrado. El SDK no reintenta esta
+pasada temporal y el procesador no sustituye tiempos ausentes por estimaciones.
+
 ### Transcripción gratuita opcional en el equipo local
 
 Se añadió `TRANSCRIPTION_ENGINE=faster-whisper`, con `large-v3-turbo` multilingüe,
