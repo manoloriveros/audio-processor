@@ -28,6 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Official pinned runtime for YouTube's JavaScript challenges (auto-detected by yt-dlp).
+COPY --from=denoland/deno:bin-2.9.7 /deno /usr/local/bin/deno
+
+# Fail the build if full YouTube support is missing from the image.
+RUN deno --version \
+    && python -c "from importlib.metadata import version; assert version('yt-dlp') == '2026.8.19'; assert version('yt-dlp-ejs') == '0.8.0'"
+
 COPY main.py separation.py structuring.py musicai_engine.py timeline.py transcription_chunks.py transcription_alignment.py transcription_service.py local_transcription.py marker_download.py chordmini.py chord_evidence.py lyric_phrases.py THIRD_PARTY_CHORDMINI.txt ./
 
 # Pin and verify the free chord model at build time, never during a request.
