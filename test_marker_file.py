@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 import sys
 import threading
+import shutil
+import tempfile
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -50,6 +54,7 @@ class MarkerFileEndpointTests(unittest.TestCase):
             self.paths.append(path)
             self.assertEqual(Path(path).name, "recording.audio")
             self.assertTrue(self.ns["_JOB_SEMAPHORE"].locked())
+            self.assertTrue(kwargs["local_only"])
             return 30
         self.probe = Mock(side_effect=probe)
         self.transcribe = Mock(return_value={"model": "whisper-1", "words": [
@@ -81,7 +86,7 @@ class MarkerFileEndpointTests(unittest.TestCase):
         self.assertEqual(result["duration"], 30)
         self.transcribe.assert_called_once()
         self.assertEqual(self.transcribe.call_args.kwargs, {"api_key": "test-only-key",
-            "timestamp_model": "whisper-1", "text_models": [], "prompt": None, "max_retries": 0})
+            "timestamp_model": "whisper-1", "text_models": [], "prompt": None, "max_retries": 0, "local_only": True})
         self.assertEqual(set(self.upload.read_sizes), {CHUNK_BYTES})
         self.assertTrue(self.upload.closed)
         self.assertTrue(all(not Path(path).parent.exists() for path in self.paths))
@@ -128,6 +133,14 @@ class MarkerFileEndpointTests(unittest.TestCase):
         self.assert_error("TRANSCRIPTION_FAILED", self.request)
         self.transcribe.assert_called_once()
         self.assertTrue(all(not Path(path).parent.exists() for path in self.paths))
+
+    def test_local_engine_receives_the_same_input_restriction_without_paid_fallback(self):
+        self.ns["TRANSCRIPTION_ENGINE"] = "faster-whisper"
+        self.ns["OPENAI_API_KEY"] = None
+        self.local.return_value = {"model": "faster-whisper/mock", "words": [{"word": "test", "start": 1, "end": 2}]}
+        self.request()
+        self.assertTrue(self.local.call_args.kwargs["local_only"])
+        self.transcribe.assert_not_called()
 
     def test_cancelled_request_holds_slot_and_file_until_inference_finishes(self):
         started, release = threading.Event(), threading.Event()
@@ -220,6 +233,62 @@ class MarkerUploadBodyLimitTests(unittest.TestCase):
     def test_other_endpoints_pass_through(self):
         self.assertEqual(self.request(headers=[], path="/transcribe-url"), 200)
         self.assertEqual(self.app_calls, 1)
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "real local decoding requires FFmpeg and FFprobe")
+class MarkerFileRealInputTests(unittest.TestCase):
+    def setUp(self):
+        self.ns = file_namespace()
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.api_request = Mock(return_value={"text": "test", "words": [{"word": "test", "start": .1, "end": .2}], "segments": []})
+
+        @contextmanager
+        def client(**kwargs):
+            yield SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=self.api_request)))
+        self.mock_api = patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=client)})
+        self.mock_api.start()
+        self.addCleanup(self.mock_api.stop)
+
+    def request(self, data):
+        upload = Upload([data])
+        return asyncio.run(self.ns["transcribe_file"](upload, "dQw4w9WgXcQ", "test-secret"))
+
+    def test_actual_m4a_is_decoded_to_valid_wav_before_mocked_whisper(self):
+        import transcription_chunks
+        path = Path(self.directory.name) / "tone.m4a"
+        transcription_chunks._run([shutil.which("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "0.5", "-c:a", "aac", str(path)], 60)
+        result = self.request(path.read_bytes())["recording"]
+        self.assertEqual(result["videoId"], "dQw4w9WgXcQ")
+        self.api_request.assert_called_once()
+        self.assertTrue(self.api_request.call_args.kwargs["file"].name.endswith(".wav"))
+        self.assertEqual(result["words"], [{"word": "test", "start": .1, "end": .2}])
+
+    def test_disguised_hls_is_rejected_without_network_or_whisper(self):
+        class Handler(BaseHTTPRequestHandler):
+            calls = 0
+            def do_GET(self):
+                Handler.calls += 1
+                self.send_response(500)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            playlist = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXTINF:1,\n"
+                f"http://127.0.0.1:{server.server_port}/segment.m4a\n#EXT-X-ENDLIST\n").encode()
+            with self.assertRaises(HttpError) as caught:
+                self.request(playlist)
+            self.assertEqual(caught.exception.detail["code"], "INVALID_AUDIO")
+            self.assertEqual(Handler.calls, 0)
+            self.api_request.assert_not_called()
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
 
 
 if __name__ == "__main__":
