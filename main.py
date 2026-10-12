@@ -19,7 +19,9 @@ import numpy as np
 import requests
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
+from youtube_clips import render_youtube_clip
 
 # ---------------------------------------------------------------------------
 # Configuracion
@@ -677,6 +679,39 @@ async def process_audio(
 
 class ProcessUrlBody(BaseModel):
     url: str
+
+
+class YouTubeClipBody(BaseModel):
+    videoId: str
+    start: float
+    duration: float
+
+
+_CLIP_SEMAPHORE = asyncio.Semaphore(2)
+
+
+@app.post("/youtube-clip")
+async def youtube_clip(body: YouTubeClipBody, x_api_secret: str = Header(None)):
+    if not API_SECRET:
+        raise HTTPException(503, "Servicio no configurado")
+    if not x_api_secret or not _secrets.compare_digest(x_api_secret, API_SECRET):
+        raise HTTPException(401, "No autorizado")
+    async with _CLIP_SEMAPHORE:
+        task = asyncio.create_task(asyncio.to_thread(
+            render_youtube_clip, body.videoId, body.start, body.duration,
+            _download_youtube_audio, YT_MAX_DURATION,
+        ))
+        # Si el cliente se desconecta, mantener el cupo hasta que el hilo termine
+        # y su finally retire los archivos temporales.
+        try:
+            audio = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            except Exception:
+                pass
+            raise
+    return Response(audio, media_type="audio/wav", headers={"Cache-Control": "private, no-store"})
 
 
 def _marker_error(status: int, code: str, message: str) -> HTTPException:

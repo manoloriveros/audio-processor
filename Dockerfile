@@ -35,7 +35,7 @@ COPY --from=denoland/deno:bin-2.9.7 /deno /usr/local/bin/deno
 RUN deno --version \
     && python -c "from importlib.metadata import version; assert version('yt-dlp') == '2026.8.19'; assert version('yt-dlp-ejs') == '0.8.0'"
 
-COPY main.py separation.py structuring.py musicai_engine.py timeline.py transcription_chunks.py transcription_alignment.py transcription_service.py local_transcription.py marker_download.py chordmini.py chord_evidence.py lyric_phrases.py THIRD_PARTY_CHORDMINI.txt ./
+COPY youtube_clips.py main.py separation.py structuring.py musicai_engine.py timeline.py transcription_chunks.py transcription_alignment.py transcription_service.py local_transcription.py marker_download.py chordmini.py chord_evidence.py lyric_phrases.py THIRD_PARTY_CHORDMINI.txt ./
 
 # Pin and verify the free chord model at build time, never during a request.
 RUN python chordmini.py --download
