@@ -407,7 +407,7 @@ def _apply_ytdlp_network_options(opts: dict, workdir: str) -> None:
         opts["cookiefile"] = cookie_path
 
 
-def _download_youtube_audio(video_id: str, workdir: str) -> str:
+def _download_youtube_audio(video_id: str, workdir: str, *, player_client: str | None = None) -> str:
     """Descarga el mejor audio del video con yt-dlp y devuelve la ruta local."""
     import yt_dlp
 
@@ -421,6 +421,10 @@ def _download_youtube_audio(video_id: str, workdir: str) -> str:
         "socket_timeout": 30,
         "retries": 2,
     }
+    if player_client:
+        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
+        opts["max_filesize"] = 25 * 1024 * 1024
+        opts["noprogress"] = True
     _apply_ytdlp_network_options(opts, workdir)
 
     try:
@@ -461,6 +465,12 @@ def _download_youtube_audio(video_id: str, workdir: str) -> str:
     if os.path.getsize(path) > 25 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="El audio del video excede 25 MB")
     return path
+
+
+def _download_setlist_clip_audio(video_id: str, workdir: str) -> str:
+    # Alternativa documentada para los 403 del cliente predeterminado de YouTube.
+    # Se aplica solo a fragmentos; conserva los clientes del flujo de transcripción.
+    return _download_youtube_audio(video_id, workdir, player_client="android")
 
 
 def _build_youtube_candidates(search_info: dict, limit: int = 5) -> list[dict]:
@@ -699,7 +709,7 @@ async def youtube_clip(body: YouTubeClipBody, x_api_secret: str = Header(None)):
     async with _CLIP_SEMAPHORE:
         task = asyncio.create_task(asyncio.to_thread(
             render_youtube_clip, body.videoId, body.start, body.duration,
-            _download_youtube_audio, YT_MAX_DURATION,
+            _download_setlist_clip_audio, YT_MAX_DURATION,
         ))
         # Si el cliente se desconecta, mantener el cupo hasta que el hilo termine
         # y su finally retire los archivos temporales.
