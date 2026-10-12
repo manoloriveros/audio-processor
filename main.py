@@ -439,7 +439,9 @@ def _download_youtube_audio(video_id: str, workdir: str, *, player_client: str |
                         f"{YT_MAX_DURATION // 60} min"
                     ),
                 )
-            info = ydl.extract_info(url, download=True)
+            # Los fragmentos reutilizan los metadatos validados; no vuelven a
+            # consultar YouTube para descargar la misma grabación.
+            info = ydl.process_ie_result(info, download=True) if player_client else ydl.extract_info(url, download=True)
             path = ydl.prepare_filename(info)
     except HTTPException:
         raise
